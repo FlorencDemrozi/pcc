@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Program Chair Copilot — Free AI tool for conference chairs</title>
+<meta name="description" content="Program Chair Copilot automates PDF compliance, COI detection, review statistics, and program building for academic conference chairs. Free to download.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+
+[data-theme="dark"]{
+  --bg:#0A0F1E;--panel:#0F1629;--panel2:#141E35;
+  --border:#1E2D4A;--border2:#243554;
+  --text:#E8ECF4;--soft:#B8C4D8;--muted:#64748B;
+  --gold:#E8A020;--gold2:#F0B040;--gold-text:#FFC84A;
+  --green:#10B981;--green-text:#34D399;
+  --red:#EF4444;--red-text:#F87171;
+  --amber:#F59E0B;--blue:#3B82F6;
+  --nav-bg:rgba(10,15,30,0.93);
+  --glow:rgba(232,160,32,0.06);
+  --shadow:0 4px 24px rgba(0,0,0,0.4);
+  --toggle-track:#1E2D4A;
+}
+[data-theme="light"]{
+  --bg:#F6F8FC;--panel:#FFFFFF;--panel2:#EEF1F8;
+  --border:#DDE1EC;--border2:#C8CEDF;
+  --text:#111827;--soft:#374151;--muted:#6B7280;
+  --gold:#C47D0A;--gold2:#A86A08;--gold-text:#92580A;
+  --green:#059669;--green-text:#047857;
+  --red:#DC2626;--red-text:#B91C1C;
+  --amber:#D97706;--blue:#2563EB;
+  --nav-bg:rgba(246,248,252,0.95);
+  --glow:rgba(196,125,10,0.04);
+  --shadow:0 4px 24px rgba(0,0,0,0.07);
+  --toggle-track:#DDE1EC;
+}
+
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-serif;font-size:16px;line-height:1.6;-webkit-font-smoothing:antialiased;transition:background .3s,color .3s}
+
+.container{max-width:1080px;margin:0 auto;padding:0 24px}
+section{padding:88px 0}
+
+/* Nav */
+nav{position:sticky;top:0;z-index:100;background:var(--nav-bg);backdrop-filter:blur(12px);border-bottom:1px solid var(--border);transition:background .3s,border-color .3s}
+.nav-inner{display:flex;align-items:center;gap:14px;height:60px;max-width:1080px;margin:0 auto;padding:0 24px}
+.nav-logo{font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;color:var(--gold);letter-spacing:.04em;text-decoration:none;margin-right:auto}
+.nav-links{display:flex;gap:22px;list-style:none}
+.nav-links a{font-size:13px;color:var(--muted);text-decoration:none;transition:color .15s}
+.nav-links a:hover{color:var(--text)}
+.nav-cta{background:var(--gold);color:#fff;padding:7px 18px;border-radius:6px;font-size:13px;font-weight:700;text-decoration:none;transition:background .15s;white-space:nowrap}
+.nav-cta:hover{background:var(--gold2)}
+
+/* Theme toggle */
+.toggle-wrap{display:flex;align-items:center;gap:6px;cursor:pointer}
+.toggle-icon{font-size:13px;line-height:1;user-select:none}
+.toggle-btn{width:40px;height:22px;border-radius:11px;background:var(--toggle-track);border:1px solid var(--border2);cursor:pointer;position:relative;transition:background .3s,border-color .3s;flex-shrink:0}
+.toggle-btn::after{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:var(--gold);transition:transform .3s,background .3s}
+[data-theme="light"] .toggle-btn::after{transform:translateX(18px)}
+
+/* Hero */
+.hero{min-height:100vh;display:flex;align-items:center;padding:110px 0 80px;position:relative;overflow:hidden}
+.hero::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse 800px 500px at 65% 45%,var(--glow),transparent);pointer-events:none}
+.hero-grid{display:grid;grid-template-columns:1fr 1fr;gap:64px;align-items:center}
+.eyebrow{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;color:var(--gold);letter-spacing:.16em;text-transform:uppercase;margin-bottom:22px}
+.hero h1{font-size:clamp(42px,5.5vw,76px);font-weight:700;line-height:1.05;letter-spacing:-.03em;margin-bottom:24px}
+.hero h1 em{font-style:normal;color:var(--gold)}
+.hero-sub{font-size:18px;color:var(--soft);max-width:520px;line-height:1.75;margin-bottom:36px}
+.hero-actions{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:48px}
+.btn-primary{background:var(--gold);color:#fff;padding:12px 26px;border-radius:7px;font-size:15px;font-weight:700;text-decoration:none;display:inline-flex;align-items:center;gap:8px;transition:background .15s}
+.btn-primary:hover{background:var(--gold2)}
+.btn-ghost{border:1px solid var(--border2);color:var(--soft);padding:12px 26px;border-radius:7px;font-size:15px;font-weight:500;text-decoration:none;display:inline-flex;align-items:center;gap:8px;transition:all .15s}
+.btn-ghost:hover{border-color:var(--gold);color:var(--gold)}
+.hero-chips{display:flex;gap:20px;flex-wrap:wrap}
+.chip{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted)}
+.chip-dot{width:6px;height:6px;border-radius:50%;background:var(--green);flex-shrink:0}
+
+/* Terminal */
+.terminal{background:var(--panel);border:1px solid var(--border);border-radius:12px;overflow:hidden;box-shadow:var(--shadow);transition:background .3s,border-color .3s,box-shadow .3s}
+.term-bar{background:var(--panel2);border-bottom:1px solid var(--border);padding:10px 16px;display:flex;align-items:center;gap:8px;transition:background .3s,border-color .3s}
+.term-dot{width:10px;height:10px;border-radius:50%}
+.term-label{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);margin-left:auto}
+.term-body{padding:20px;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.85;min-height:218px}
+.tl{display:block;opacity:0;animation:fi .25s forwards}
+.tc-d{color:var(--muted)}.tc-g{color:var(--gold)}.tc-ok{color:var(--green-text)}.tc-err{color:var(--red-text)}.tc-w{color:var(--amber)}
+@keyframes fi{to{opacity:1}}
+
+/* Stats */
+.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--border);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-top:72px;transition:background .3s,border-color .3s}
+.stat{background:var(--panel);padding:28px 22px;transition:background .3s}
+.stat-n{font-family:'JetBrains Mono',monospace;font-size:36px;font-weight:600;color:var(--text);letter-spacing:-.02em;line-height:1}
+.stat-n em{color:var(--gold);font-style:normal}
+.stat-l{font-size:12px;color:var(--muted);margin-top:6px}
+
+/* Section header */
+.sec-label{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;color:var(--gold);letter-spacing:.14em;text-transform:uppercase;margin-bottom:14px}
+.sec-title{font-size:clamp(26px,3.5vw,40px);font-weight:700;letter-spacing:-.02em;line-height:1.15;margin-bottom:14px}
+.sec-sub{font-size:16px;color:var(--soft);max-width:560px;line-height:1.7}
+
+/* Features */
+.feat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:48px}
+.feat{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:26px;transition:border-color .2s,transform .2s,background .3s,box-shadow .2s}
+.feat:hover{border-color:var(--border2);transform:translateY(-2px);box-shadow:var(--shadow)}
+.feat-ico{width:42px;height:42px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:19px;margin-bottom:18px}
+.feat-title{font-size:15px;font-weight:600;margin-bottom:6px}
+.feat-body{font-size:13px;color:var(--soft);line-height:1.65}
+.feat-tag{display:inline-flex;align-items:center;gap:5px;margin-top:14px;font-size:11px;font-weight:600;font-family:'JetBrains Mono',monospace;padding:2px 8px;border-radius:4px;letter-spacing:.03em}
+
+/* Steps */
+.how-wrap{background:var(--panel);border-top:1px solid var(--border);border-bottom:1px solid var(--border);transition:background .3s,border-color .3s}
+.steps{display:grid;grid-template-columns:repeat(4,1fr);margin-top:48px;position:relative}
+.steps::before{content:'';position:absolute;top:26px;left:12%;right:12%;height:1px;background:var(--border)}
+.step{text-align:center;padding:0 14px}
+.step-n{width:52px;height:52px;border-radius:50%;background:var(--panel2);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;color:var(--gold);margin:0 auto 18px;position:relative;z-index:1;transition:background .3s,border-color .3s}
+.step-title{font-size:14px;font-weight:600;margin-bottom:6px}
+.step-body{font-size:13px;color:var(--soft);line-height:1.6}
+.platforms{display:flex;gap:12px;margin-top:36px;flex-wrap:wrap}
+.plat{background:var(--panel2);border:1px solid var(--border);border-radius:7px;padding:12px 18px;display:flex;align-items:center;gap:9px;font-size:13px;font-weight:500;transition:background .3s,border-color .3s}
+
+/* Feedback */
+.feedback-band{background:var(--panel2);border-top:1px solid var(--border);border-bottom:1px solid var(--border);transition:background .3s,border-color .3s}
+.feedback-inner{display:grid;grid-template-columns:1fr 1fr;gap:56px;align-items:center}
+.feedback-text h2{font-size:clamp(24px,3vw,34px);font-weight:700;letter-spacing:-.02em;line-height:1.2;margin-bottom:14px}
+.feedback-text p{font-size:15px;color:var(--soft);line-height:1.75;margin-bottom:20px}
+.feedback-why{display:flex;flex-direction:column;gap:14px}
+.why-item{display:flex;gap:14px;align-items:flex-start}
+.why-icon{width:36px;height:36px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0;background:var(--panel);border:1px solid var(--border);transition:background .3s,border-color .3s}
+.why-title{font-size:14px;font-weight:600;margin-bottom:2px}
+.why-body{font-size:13px;color:var(--soft);line-height:1.5}
+.feedback-form-card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:36px;transition:background .3s,border-color .3s}
+.form-title{font-size:17px;font-weight:700;margin-bottom:6px}
+.form-sub{font-size:13px;color:var(--muted);margin-bottom:24px;line-height:1.5}
+.form-fields{display:flex;flex-direction:column;gap:12px;margin-bottom:20px}
+.field-label{font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;margin-bottom:5px}
+.field-input{width:100%;padding:9px 12px;border:1px solid var(--border);border-radius:6px;background:var(--panel2);color:var(--text);font-family:'Inter',sans-serif;font-size:14px;outline:none;transition:border-color .15s,background .3s,color .3s}
+.field-input:focus{border-color:var(--gold)}
+.field-input::placeholder{color:var(--muted)}
+.form-note{font-size:12px;color:var(--muted);line-height:1.5;margin-top:14px}
+.btn-feedback{width:100%;background:var(--gold);color:#fff;border:none;padding:12px;border-radius:7px;font-size:15px;font-weight:700;cursor:pointer;transition:background .15s;font-family:'Inter',sans-serif}
+.btn-feedback:hover{background:var(--gold2)}
+
+/* About */
+.about-wrap{background:var(--panel);border-top:1px solid var(--border);transition:background .3s,border-color .3s}
+.about-grid{display:grid;grid-template-columns:1fr 1fr;gap:48px;align-items:start;margin-top:48px}
+.about-text p{font-size:15px;color:var(--soft);line-height:1.8;margin-bottom:16px}
+.about-text strong{color:var(--text)}
+.about-link{display:inline-flex;align-items:center;gap:7px;font-size:14px;color:var(--muted);text-decoration:none;transition:color .15s;margin-top:4px}
+.about-link:hover{color:var(--gold)}
+.trust-cards{display:flex;flex-direction:column;gap:10px}
+.trust-card{background:var(--panel2);border:1px solid var(--border);border-radius:9px;padding:14px 18px;display:flex;align-items:center;gap:13px;transition:background .3s,border-color .3s}
+.trust-icon{font-size:18px;flex-shrink:0}
+.trust-title{font-size:13px;font-weight:600;color:var(--text);line-height:1.2}
+.trust-sub{font-size:12px;color:var(--muted);margin-top:2px}
+
+/* CTA strip */
+.cta-strip{text-align:center;padding:72px 0}
+.cta-strip h2{font-size:clamp(26px,3.5vw,40px);font-weight:700;letter-spacing:-.02em;margin-bottom:14px}
+.cta-strip p{font-size:16px;color:var(--soft);max-width:480px;margin:0 auto 32px;line-height:1.7}
+.cta-email{font-family:'JetBrains Mono',monospace;font-size:14px;color:var(--gold);display:block;margin-top:16px;text-decoration:none}
+
+/* Footer */
+footer{border-top:1px solid var(--border);padding:28px 0}
+.footer-inner{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:14px}
+.footer-logo{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--muted)}
+.footer-copy{font-size:12px;color:var(--muted)}
+.footer-links{display:flex;gap:18px}
+.footer-links a{font-size:12px;color:var(--muted);text-decoration:none;transition:color .15s}
+.footer-links a:hover{color:var(--gold)}
+
+/* Responsive */
+@media(max-width:768px){
+  .hero-grid,.feedback-inner,.about-grid{grid-template-columns:1fr}
+  .feat-grid{grid-template-columns:1fr}
+  .stats-row{grid-template-columns:1fr 1fr}
+  .steps{grid-template-columns:1fr 1fr;gap:28px}
+  .steps::before{display:none}
+  .nav-links{display:none}
+  .hero{padding:100px 0 60px}
+  section{padding:64px 0}
+}
+@media(max-width:480px){
+  .stats-row{grid-template-columns:1fr}
+  .hero h1{font-size:36px}
+}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="nav-inner">
+    <a href="#" class="nav-logo">Program Chair Copilot</a>
+    <ul class="nav-links">
+      <li><a href="#features">Features</a></li>
+      <li><a href="#how">How it works</a></li>
+      <li><a href="#feedback">Feedback</a></li>
+      <li><a href="#about">About</a></li>
+    </ul>
+    <div class="toggle-wrap" id="themeWrap" title="Toggle light / dark">
+      <span class="toggle-icon">☀</span>
+      <button class="toggle-btn" id="themeBtn" aria-label="Toggle light/dark mode"></button>
+      <span class="toggle-icon">🌙</span>
+    </div>
+    <a href="mailto:florenc1991@gmail.com?subject=Program Chair Copilot — download request" class="nav-cta">Get the tool →</a>
+  </div>
+</nav>
+
+<!-- Hero -->
+<section class="hero">
+  <div class="container">
+    <div class="hero-grid">
+      <div>
+        <p class="eyebrow">Program Chair Copilot</p>
+        <h1>The part of your<br>conference that <em>runs itself.</em></h1>
+        <p class="hero-sub">A free desktop tool that automates the repetitive work of running an academic conference — PDF compliance, COI detection, review analysis, program building, and more.</p>
+        <div class="hero-actions">
+          <a href="mailto:florenc1991@gmail.com?subject=Program Chair Copilot — download request" class="btn-primary">Download for free →</a>
+          <a href="#features" class="btn-ghost">See all features</a>
+        </div>
+        <div class="hero-chips">
+          <span class="chip"><span class="chip-dot"></span>Completely free</span>
+          <span class="chip"><span class="chip-dot"></span>Runs locally — no data leaves your machine</span>
+          <span class="chip"><span class="chip-dot"></span>Windows · macOS · Linux</span>
+        </div>
+      </div>
+      <div>
+        <div class="terminal">
+          <div class="term-bar">
+            <div class="term-dot" style="background:#EF4444"></div>
+            <div class="term-dot" style="background:#F59E0B"></div>
+            <div class="term-dot" style="background:#10B981"></div>
+            <span class="term-label">compliance_check.log</span>
+          </div>
+          <div class="term-body" id="term"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="stats-row">
+      <div class="stat"><div class="stat-n"><em>12</em></div><div class="stat-l">Modules — from compliance to program building</div></div>
+      <div class="stat"><div class="stat-n">0<em>s</em></div><div class="stat-l">Data ever sent to a third-party server</div></div>
+      <div class="stat"><div class="stat-n"><em>5</em></div><div class="stat-l">AI providers supported — including local Ollama</div></div>
+      <div class="stat"><div class="stat-n">100<em>%</em></div><div class="stat-l">Free — no account, no credit card, no catch</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- Features -->
+<section id="features">
+  <div class="container">
+    <p class="sec-label">What it does</p>
+    <h2 class="sec-title">Every manual task,<br>handled in one tool</h2>
+    <p class="sec-sub">Built by a program chair who got tired of doing the same things by hand every conference cycle.</p>
+
+    <div class="feat-grid">
+      <div class="feat">
+        <div class="feat-ico" style="background:rgba(16,185,129,.1)">✅</div>
+        <div class="feat-title">PDF Compliance</div>
+        <div class="feat-body">Checks every submitted PDF for page count, font embedding, double-blind compliance, column layout, and references. Drag in a ZIP and it processes the entire batch.</div>
+        <span class="feat-tag" style="background:rgba(16,185,129,.1);color:var(--green-text)">● Deterministic — no API call</span>
+      </div>
+      <div class="feat">
+        <div class="feat-ico" style="background:rgba(59,130,246,.1)">📊</div>
+        <div class="feat-title">Review Statistics</div>
+        <div class="feat-body">Score distributions, reviewer calibration, high-variance papers, missing reviews, acceptance rates per track. Flags short or inconsistent reviews automatically.</div>
+        <span class="feat-tag" style="background:rgba(16,185,129,.1);color:var(--green-text)">● Deterministic — no API call</span>
+      </div>
+      <div class="feat">
+        <div class="feat-ico" style="background:rgba(239,68,68,.1)">🔍</div>
+        <div class="feat-title">Conflict of Interest</div>
+        <div class="feat-body">Scans every TPC member × paper pair for name, email, and affiliation conflicts. Uses fuzzy matching, ROR database lookup, and optional AI expansion to catch edge cases.</div>
+        <span class="feat-tag" style="background:rgba(16,185,129,.1);color:var(--green-text)">● Deterministic — no API call</span>
+      </div>
+      <div class="feat">
+        <div class="feat-ico" style="background:rgba(232,160,32,.12)">🔬</div>
+        <div class="feat-title">AI Screening</div>
+        <div class="feat-body">Reads each paper PDF and assesses novelty, state-of-the-art coverage, writing quality, and LLM-writing signals. Strictness is adjustable per dimension. Uses your own API key.</div>
+        <span class="feat-tag" style="background:rgba(232,160,32,.12);color:var(--gold-text)">● Uses your LLM provider</span>
+      </div>
+      <div class="feat">
+        <div class="feat-ico" style="background:rgba(245,158,11,.1)">⚖</div>
+        <div class="feat-title">Decisions</div>
+        <div class="feat-body">Synthesises the full review set for each paper into a calibrated accept/reject recommendation with rationale, strengths, and weaknesses. Exports to CSV or Excel.</div>
+        <span class="feat-tag" style="background:rgba(232,160,32,.12);color:var(--gold-text)">● Uses your LLM provider</span>
+      </div>
+      <div class="feat">
+        <div class="feat-ico" style="background:rgba(13,148,136,.1)">📅</div>
+        <div class="feat-title">Program Builder</div>
+        <div class="feat-body">Conversational AI interface that builds a full day-by-day schedule from your accepted papers. Sessions, keynotes, and breaks — all exportable as CSV.</div>
+        <span class="feat-tag" style="background:rgba(232,160,32,.12);color:var(--gold-text)">● Uses your LLM provider</span>
+      </div>
+      <div class="feat">
+        <div class="feat-ico" style="background:rgba(139,92,246,.1)">📋</div>
+        <div class="feat-title">Review Quality</div>
+        <div class="feat-body">Assesses each reviewer's text for completeness, score–text consistency, and technical depth. Flags reviews that need a follow-up message from the chair.</div>
+        <span class="feat-tag" style="background:rgba(232,160,32,.12);color:var(--gold-text)">● Uses your LLM provider</span>
+      </div>
+      <div class="feat">
+        <div class="feat-ico" style="background:rgba(248,113,113,.1)">📸</div>
+        <div class="feat-title">Camera-Ready Check</div>
+        <div class="feat-body">Verifies final author PDFs for author names, copyright notice, PDF eXpress stamp, and font embedding. Manual override per paper for edge cases.</div>
+        <span class="feat-tag" style="background:rgba(16,185,129,.1);color:var(--green-text)">● Deterministic — no API call</span>
+      </div>
+      <div class="feat">
+        <div class="feat-ico" style="background:rgba(232,160,32,.12)">✉</div>
+        <div class="feat-title">Email Suite</div>
+        <div class="feat-body">Drafts every conference email — CFP, TPC invite, review reminders, acceptance/rejection, camera-ready instructions — pre-filled with your conference details.</div>
+        <span class="feat-tag" style="background:rgba(232,160,32,.12);color:var(--gold-text)">● Uses your LLM provider</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- How it works -->
+<section id="how" class="how-wrap">
+  <div class="container">
+    <p class="sec-label">How it works</p>
+    <h2 class="sec-title">Up and running in under five minutes</h2>
+    <div class="steps">
+      <div class="step">
+        <div class="step-n">01</div>
+        <div class="step-title">Download &amp; open</div>
+        <div class="step-body">Single executable — no Python, no Node, no install wizard. Double-click and it opens in your browser.</div>
+      </div>
+      <div class="step">
+        <div class="step-n">02</div>
+        <div class="step-title">Add your CFP</div>
+        <div class="step-body">Upload your Call for Papers PDF. AI extracts deadlines, tracks, page limits, and formatting rules automatically.</div>
+      </div>
+      <div class="step">
+        <div class="step-n">03</div>
+        <div class="step-title">Import your files</div>
+        <div class="step-body">Upload the papers ZIP, review export, TPC list, and author list once. Every module reads from the same data.</div>
+      </div>
+      <div class="step">
+        <div class="step-n">04</div>
+        <div class="step-title">Run what you need</div>
+        <div class="step-body">Each module runs independently. Export results as CSV or Excel at any point.</div>
+      </div>
+    </div>
+    <div class="platforms">
+      <div class="plat">🪟 Windows 10 / 11</div>
+      <div class="plat">🍎 macOS 12+</div>
+      <div class="plat">🐧 Linux (Ubuntu 22+)</div>
+      <div class="plat">🤖 Claude · GPT-4o · Gemini · Groq · Ollama</div>
+    </div>
+  </div>
+</section>
+
+<!-- Feedback -->
+<section id="feedback" class="feedback-band">
+  <div class="container">
+    <div class="feedback-inner">
+      <div>
+        <p class="sec-label">Your feedback matters</p>
+        <div class="feedback-text">
+          <h2>Help shape the next version</h2>
+          <p>This tool is in active development. Every bug report, feature request, and real-world usage story directly informs what gets built next. If you chair a conference and try it out — I genuinely want to hear what worked, what didn't, and what's missing.</p>
+        </div>
+        <div class="feedback-why">
+          <div class="why-item">
+            <div class="why-icon">🔧</div>
+            <div>
+              <div class="why-title">Fix real bugs</div>
+              <div class="why-body">Every conference uses slightly different file formats and naming conventions. Your edge cases make the tool more robust for everyone.</div>
+            </div>
+          </div>
+          <div class="why-item">
+            <div class="why-icon">📐</div>
+            <div>
+              <div class="why-title">Shape the features</div>
+              <div class="why-body">The roadmap is not fixed. What modules would save you the most time? What checks are still missing?</div>
+            </div>
+          </div>
+          <div class="why-item">
+            <div class="why-icon">📄</div>
+            <div>
+              <div class="why-title">Contribute to the research</div>
+              <div class="why-body">Usage data and feedback will support an academic publication on AI-assisted conference management — a contribution to the community, not just a product.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div>
+        <div class="feedback-form-card">
+          <div class="form-title">Share your experience</div>
+          <div class="form-sub">Takes about 3 minutes. No account needed — just tell me how it went.</div>
+          <div class="form-fields">
+            <div>
+              <div class="field-label">Your name <span style="color:var(--muted);font-weight:400">(optional)</span></div>
+              <input class="field-input" type="text" placeholder="e.g. Prof. Jane Smith">
+            </div>
+            <div>
+              <div class="field-label">Conference / institution <span style="color:var(--muted);font-weight:400">(optional)</span></div>
+              <input class="field-input" type="text" placeholder="e.g. IEEE GLOBECOM 2026">
+            </div>
+            <div>
+              <div class="field-label">Your feedback</div>
+              <textarea class="field-input" rows="4" placeholder="What worked well? What was broken or missing? What would you like to see next?" style="resize:vertical"></textarea>
+            </div>
+          </div>
+          <!-- Replace the href below with your Google Form or Microsoft Form link -->
+          <a href="YOUR_FORM_LINK_HERE" target="_blank" rel="noopener">
+            <button class="btn-feedback" type="button">Open feedback form →</button>
+          </a>
+          <p class="form-note">The button opens a short Google / Microsoft Form where you can submit your response. Your contact details are optional and will never be shared.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- About -->
+<section id="about" class="about-wrap">
+  <div class="container">
+    <p class="sec-label">About</p>
+    <h2 class="sec-title">Built by someone who<br>has been there</h2>
+    <div class="about-grid">
+      <div class="about-text">
+        <p><strong>Prof. Florenc Demrozi</strong> is an Assistant Professor of Telecommunications at the University of Catania. He has served on the technical program committees of IEEE ICC, GLOBECOM, ICMLCN, VTC, and others — and spent too many late nights manually checking PDFs, hunting for affiliation conflicts, and chasing reviewers.</p>
+        <p>Program Chair Copilot started as a personal tool to automate what didn't need to be manual. It grew into something worth sharing with the community that runs these conferences.</p>
+        <p>It runs entirely on your machine. Your data never leaves your computer except for the AI calls you choose to make — and even then, only the necessary content is sent directly to your own LLM provider using your own API key. No telemetry. No account. No server.</p>
+        <a href="mailto:florenc1991@gmail.com" class="about-link">✉ florenc1991@gmail.com</a>
+        <a href="https://www.linkedin.com/in/florenc-demrozi" class="about-link" target="_blank" rel="noopener">in LinkedIn → Florenc Demrozi</a>
+      </div>
+      <div class="trust-cards">
+        <div class="trust-card"><span class="trust-icon">🔒</span><div><div class="trust-title">100% local processing</div><div class="trust-sub">Your papers and reviews never leave your machine</div></div></div>
+        <div class="trust-card"><span class="trust-icon">🔑</span><div><div class="trust-title">Your own API keys</div><div class="trust-sub">Stored at ~/.pcc/config.json — never transmitted to us</div></div></div>
+        <div class="trust-card"><span class="trust-icon">🤖</span><div><div class="trust-title">Provider-agnostic</div><div class="trust-sub">Claude · GPT-4o · Gemini · Groq · Ollama (local)</div></div></div>
+        <div class="trust-card"><span class="trust-icon">🆓</span><div><div class="trust-title">Free, no strings</div><div class="trust-sub">No account, no trial expiry on the core checks</div></div></div>
+        <div class="trust-card"><span class="trust-icon">💻</span><div><div class="trust-title">Cross-platform</div><div class="trust-sub">Windows · macOS · Linux — one download per platform</div></div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CTA strip -->
+<div class="cta-strip">
+  <div class="container">
+    <h2>Try it on your next conference</h2>
+    <p>Send me an email and I'll send you the download link for your platform. Takes two minutes to get started.</p>
+    <a href="mailto:florenc1991@gmail.com?subject=Program Chair Copilot — download request" class="btn-primary" style="font-size:16px;padding:14px 32px;display:inline-flex">Download for free →</a>
+    <a href="mailto:florenc1991@gmail.com" class="cta-email">florenc1991@gmail.com</a>
+  </div>
+</div>
+
+<footer>
+  <div class="container">
+    <div class="footer-inner">
+      <span class="footer-logo">Program Chair Copilot</span>
+      <span class="footer-copy">© 2025 Prof. Florenc Demrozi · University of Catania</span>
+      <div class="footer-links">
+        <a href="mailto:florenc1991@gmail.com">Contact</a>
+        <a href="#feedback">Feedback</a>
+        <a href="#about">Privacy</a>
+      </div>
+    </div>
+  </div>
+</footer>
+
+<script>
+// Theme
+const html = document.documentElement;
+const btn  = document.getElementById('themeBtn');
+const saved = localStorage.getItem('pcc-theme');
+const sys   = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+html.setAttribute('data-theme', saved || sys);
+btn.addEventListener('click', () => {
+  const next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  html.setAttribute('data-theme', next);
+  localStorage.setItem('pcc-theme', next);
+});
+
+// Terminal
+const LINES = [
+  ['tc-d',  '$ pcc --check compliance --zip papers.zip'],
+  ['tc-d',  '  Loading 200 PDFs...'],
+  ['tc-g',  '  [✓] IEEE two-column layout detected'],
+  ['tc-ok', '  001_paper.pdf    PASS   6p · fonts OK · blind OK'],
+  ['tc-ok', '  002_paper.pdf    PASS   6p · fonts OK · blind OK'],
+  ['tc-ok', '  003_paper.pdf    PASS   5p · fonts OK · blind OK'],
+  ['tc-err','  004_paper.pdf    FAIL   8p · 2 unembedded fonts'],
+  ['tc-ok', '  005_paper.pdf    PASS   6p · fonts OK · blind OK'],
+  ['tc-w',  '  ...'],
+  ['tc-d',  '  200 papers checked in 3m 52s'],
+  ['tc-g',  '  181 PASS · 19 FAIL  →  compliance_report.csv'],
+];
+const term = document.getElementById('term');
+let i = 0;
+(function next() {
+  if (i >= LINES.length) { setTimeout(() => { term.innerHTML=''; i=0; next(); }, 3200); return; }
+  const [cls, txt] = LINES[i++];
+  const s = document.createElement('span');
+  s.className = 'tl ' + cls;
+  s.textContent = txt;
+  term.appendChild(s);
+  setTimeout(next, i === 1 ? 350 : 190);
+})();
+
+// Smooth scroll
+document.querySelectorAll('a[href^="#"]').forEach(a =>
+  a.addEventListener('click', e => {
+    const t = document.querySelector(a.getAttribute('href'));
+    if (t) { e.preventDefault(); t.scrollIntoView({ behavior:'smooth', block:'start' }); }
+  })
+);
+</script>
+</body>
+</html>

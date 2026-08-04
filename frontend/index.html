@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Program Chair Copilot</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+      html, body, #root { height: 100%; }
+      body { font-family: 'Inter', system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+
+      /* Scrollbar */
+      ::-webkit-scrollbar { width: 6px; height: 6px; }
+      ::-webkit-scrollbar-track { background: transparent; }
+      ::-webkit-scrollbar-thumb { background: #3a4560; border-radius: 3px; }
+      ::-webkit-scrollbar-thumb:hover { background: #4a5570; }
+
+      /* Focus rings */
+      input:focus, select:focus, textarea:focus {
+        outline: none;
+        border-color: #E8A020 !important;
+        box-shadow: 0 0 0 2px rgba(232,160,32,0.15) !important;
+      }
+      button:focus-visible { outline: 2px solid #E8A020; outline-offset: 2px; }
+
+      /* Select dropdowns — use system appearance so options respect OS theme */
+      select { appearance: auto; }
+
+      /* Dark mode (default) */
+      :root {
+        --pcc-input-bg:    #141E35;
+        --pcc-input-color: #E8ECF4;
+        --pcc-input-border:#1E2D4A;
+        --pcc-select-bg:   #141E35;
+        --pcc-select-color:#E8ECF4;
+      }
+      /* Light mode — toggled by JS adding data-theme="light" to <html> */
+      html[data-theme="light"] {
+        --pcc-input-bg:    #FFFFFF;
+        --pcc-input-color: #111318;
+        --pcc-input-border:#DDE1E8;
+        --pcc-select-bg:   #FFFFFF;
+        --pcc-select-color:#111318;
+      }
+
+      input, textarea, select {
+        background-color: var(--pcc-input-bg) !important;
+        color: var(--pcc-input-color) !important;
+        border-color: var(--pcc-input-border);
+      }
+      select option {
+        background: var(--pcc-select-bg);
+        color: var(--pcc-select-color);
+      }
+
+      /* Progress animation */
+      @keyframes progress-indeterminate {
+        0%   { transform: translateX(-100%); width: 40%; }
+        100% { transform: translateX(300%);  width: 40%; }
+      }
+
+      /* Prevent flash of wrong theme */
+      html { background: #0A0F1E; }
+      html[data-theme="light"] { background: #FAFAF8; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

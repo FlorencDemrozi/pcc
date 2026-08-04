@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv*/
+*.egg-info/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Build output
+build/dist/
+build/work/
+
+# Secrets
+backend/config.json
+
+# OS
+.DS_Store
+Thumbs.db

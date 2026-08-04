@@ -1,0 +1,57 @@
+Program Chair Copilot
+Copyright (c) 2025 Prof. Florenc Demrozi (florenc1991@gmail.com)
+All rights reserved.
+
+─────────────────────────────────────────────────────────────────────────────
+NON-COMMERCIAL USE LICENSE
+─────────────────────────────────────────────────────────────────────────────
+
+1. GRANT OF LICENSE
+   Subject to the terms below, the author grants you a worldwide, royalty-free,
+   non-exclusive, non-transferable license to use, copy, and run this software
+   solely for non-commercial purposes, including academic research, personal
+   use, and the organisation of non-profit scientific conferences.
+
+2. NON-COMMERCIAL USE DEFINED
+   "Non-commercial use" means use that is not primarily intended for, or
+   directed towards, commercial advantage or monetary compensation. Academic
+   conferences, university research groups, and individual researchers are
+   considered non-commercial users. Commercial entities (companies, for-profit
+   organisations, consulting firms) are NOT permitted to use this software
+   under this license without a separate commercial license.
+
+3. RESTRICTIONS — YOU MAY NOT:
+   a) Use the software for commercial purposes, including but not limited to:
+      selling access to the software, incorporating it into a paid product or
+      service, using it to provide paid consulting or services to third parties.
+   b) Redistribute, sublicense, sell, rent, lease, or transfer the software or
+      any modified version of it to any third party.
+   c) Remove, alter, or obscure any copyright notice, author attribution, or
+      license notice contained in the software.
+   d) Claim ownership of the software or misrepresent its origin.
+
+4. COMMERCIAL LICENSING
+   Commercial use requires a separate written license agreement with the author.
+   To inquire about commercial licensing, contact: florenc1991@gmail.com
+
+5. RESERVATION OF RIGHTS
+   The author reserves the right to:
+   a) Release future versions of the software under different license terms,
+      including commercial-only terms, at any time and without prior notice.
+   b) Grant commercial licenses to third parties on terms of the author's
+      choosing.
+   c) Discontinue free distribution of the software at any time.
+   All rights not expressly granted in this license are reserved by the author.
+
+6. NO WARRANTY
+   This software is provided "as is", without warranty of any kind, express or
+   implied. The author shall not be liable for any damages arising from use of
+   the software.
+
+7. GOVERNING LAW
+   This license is governed by the laws of the European Union. Any disputes
+   shall be resolved in the jurisdiction of the author's country of residence.
+
+─────────────────────────────────────────────────────────────────────────────
+For commercial licensing inquiries: florenc1991@gmail.com
+─────────────────────────────────────────────────────────────────────────────
