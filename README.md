@@ -84,7 +84,7 @@ API keys are stored locally at `~/.pcc/config.json` and never transmitted anywhe
 
 PCC is being developed as part of a research project on AI-assisted academic conference management at the University of Stavanger. If you use the tool to chair a conference, we'd appreciate 5 minutes of feedback — it directly informs our study.
 
-**[Leave feedback →](https://your-form-link-here)**
+**[Leave feedback →](https://forms.cloud.microsoft/e/EeQg7grrF5)**
 
 ---
 
