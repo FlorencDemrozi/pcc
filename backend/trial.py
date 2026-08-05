@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Literal
 
 # ── Build-time constant (replaced by build script) ────────────────────────────
-BUILD_DATE = "2026-08-04"
+BUILD_DATE = "2026-08-05"
 
 TRIAL_DAYS = 100
 

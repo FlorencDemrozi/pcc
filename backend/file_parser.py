@@ -188,6 +188,84 @@ def parse_easychair_review_txt(content: bytes) -> list[dict]:
     return reviews
 
 
+def parse_easychair_list_txt(content: bytes) -> list[dict]:
+    """
+    Parse EasyChair 'LIST OF REVIEWS' style TXT export.
+
+    Format:
+        LIST OF REVIEWS
+        ...
+        Paper #42
+
+        Title: Some Title
+        Authors: A, B
+
+        Review #42a by submitter 1 (role: reviewer):
+        Overall evaluation: 3 (strong accept)
+        Reviewer's confidence: 4
+
+        Text:
+        ...review text...
+
+        Review #42b by submitter 2 ...
+    """
+    text = content.decode("utf-8-sig", errors="replace")
+    reviews = []
+
+    # Split by "Paper #N" blocks
+    paper_blocks = re.split(r'(?:^|\n)\s*Paper\s+#(\d+)\s*\n', text, flags=re.IGNORECASE)
+
+    i = 1
+    while i < len(paper_blocks) - 1:
+        paper_id = paper_blocks[i].strip()
+        block    = paper_blocks[i + 1]
+        i += 2
+
+        title_m   = re.search(r'^Title:\s*(.+)', block, re.MULTILINE | re.IGNORECASE)
+        authors_m = re.search(r'^Authors?:\s*(.+)', block, re.MULTILINE | re.IGNORECASE)
+        title   = title_m.group(1).strip()   if title_m   else ""
+        authors = authors_m.group(1).strip() if authors_m else ""
+
+        # Split into individual reviews
+        rev_sections = re.split(
+            r'Review\s+#\d+\w*\s+by\s+([^(:]+?)(?:\s*\([^)]*\))?\s*:',
+            block, flags=re.IGNORECASE
+        )
+
+        j = 1
+        while j < len(rev_sections) - 1:
+            reviewer = rev_sections[j].strip()
+            section  = rev_sections[j + 1]
+            j += 2
+
+            eval_m  = re.search(r'Overall evaluation:\s*([+-]?\d+)', section, re.IGNORECASE)
+            conf_m  = re.search(r"Reviewer'?s?\s+confidence:\s*(\d+)", section, re.IGNORECASE)
+            score_m = re.search(r'(?:TOTAL SCORE|Score):\s*([+-]?\d+)', section, re.IGNORECASE)
+
+            score      = (score_m.group(1) if score_m
+                          else eval_m.group(1) if eval_m else "")
+            confidence = conf_m.group(1) if conf_m else ""
+
+            # Review body: after "Text:" or "---- OVERALL EVALUATION ----"
+            body_m = re.search(
+                r'(?:^Text:|----\s*OVERALL EVALUATION\s*----)\s*\n(.*)',
+                section, re.DOTALL | re.IGNORECASE | re.MULTILINE
+            )
+            review_text = body_m.group(1).strip() if body_m else section.strip()
+
+            reviews.append({
+                "paper_id":   paper_id,
+                "title":      title,
+                "authors":    authors,
+                "reviewer":   reviewer,
+                "score":      score,
+                "confidence": confidence,
+                "text":       review_text,
+            })
+
+    return reviews
+
+
 def parse_review_summary_xlsx(content: bytes) -> list[dict]:
     """
     Parse EasyChair review_summary.xlsx.
@@ -346,10 +424,14 @@ def _detect_format(content: bytes, filename: str) -> str:
     name = (filename or "").lower()
 
     if name.endswith(".txt"):
-        # Peek at content
-        sample = content[:500].decode("utf-8-sig", errors="replace")
-        if "LIST OF REVIEWS" in sample or re.search(r'\*{5,}\s*PAPER\s+\d+', sample):
+        # Peek at content — use 1000 bytes so the first ***** PAPER ***** line is visible
+        sample = content[:1000].decode("utf-8-sig", errors="replace")
+        # Standard EasyChair format: ***** PAPER N ***** delimiters
+        if re.search(r'\*{5,}\s*PAPER\s+\d+', sample):
             return "easychair_review_txt"
+        # EasyChair "list" format: "LIST OF REVIEWS" header, "Paper #N" style
+        if "LIST OF REVIEWS" in sample.upper():
+            return "easychair_list_txt"
         return "generic_txt"
 
     if name.endswith((".xlsx", ".xls")):
@@ -401,6 +483,15 @@ async def parse_any_file(
 
     if fmt == "easychair_review_txt":
         rows = parse_easychair_review_txt(content)
+        if rows:
+            return rows
+
+    elif fmt == "easychair_list_txt":
+        rows = parse_easychair_list_txt(content)
+        if rows:
+            return rows
+        # Fallback to generic if our parser missed
+        rows = _parse_generic_txt_reviews(content)
         if rows:
             return rows
 

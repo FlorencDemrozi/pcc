@@ -147,7 +147,7 @@ export default function App(){
       case "reviews":    return <ReviewQualityModule conf={conf} metaRows={metaRows} reviewRows={reviewRows} activeTrack={activeTrack}/>;
       case "decisions":  return <DecisionsModule conf={conf} metaRows={metaRows} reviewRows={reviewRows} activeTrack={activeTrack}/>;
       case "coi":        return <COIModule conf={conf} metaRows={metaRows} tpcRows={tpcRows} authorRows={authorRows} activeTrack={activeTrack}/>;
-      case "program":    return <ProgramBuilderModule conf={conf} metaRows={metaRows} ssRows={ssRows} activeTrack={activeTrack}/>;
+      case "program":    return <ProgramBuilderModule conf={conf} metaRows={metaRows}/>;
       case "camera":     return <CameraReadyModule conf={conf} pdfFiles={pdfFiles} authorRows={authorRows}/>;
       case "emails":     return <EmailModule conf={conf}/>;
       default:           return null;
