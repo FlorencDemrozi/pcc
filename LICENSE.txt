@@ -24,7 +24,9 @@ NON-COMMERCIAL USE LICENSE
    a) Use the software for commercial purposes, including but not limited to:
       selling access to the software, incorporating it into a paid product or
       service, using it to provide paid consulting or services to third parties.
-   b) Redistribute, sublicense, sell, rent, lease, or transfer the software or any modified version as part of a paid product or service, or for commercial gain. Sharing the original, unmodified repository link is permitted
+   b) Redistribute, sublicense, sell, rent, lease, or transfer the software or 
+      any modified version as part of a paid product or service, or for commercial 
+      gain. Sharing the original, unmodified repository link is permitted.
    c) Remove, alter, or obscure any copyright notice, author attribution, or
       license notice contained in the software.
    d) Claim ownership of the software or misrepresent its origin.
