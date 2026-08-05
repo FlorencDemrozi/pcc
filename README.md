@@ -70,7 +70,7 @@ PCC reads whatever EasyChair exports:
 
 | Provider | Models | Notes |
 |---|---|---|
-| Anthropic Claude | claude-3-5-sonnet, claude-3-haiku | Recommended for screening and decisions |
+| Anthropic Claude | claude-3-5-sonnet, claude-3-haiku | Recommended for screening, decisions, and program building |
 | OpenAI | gpt-4o, gpt-4o-mini | Full support |
 | Google Gemini | gemini-1.5-pro, gemini-1.5-flash | Full support |
 | Groq | llama-3, mixtral | Fast, good for large batches |
@@ -115,4 +115,4 @@ MIT — use it, fork it, extend it. If you publish results using PCC, a citation
 
 ---
 
-*Built by [Florenc Demrozi](mailto:florenc1991@gmail.com) · University of Stavanger / University of Catania*
+*Built by [Florenc Demrozi](mailto:florenc1991@gmail.com) and Klevia Dishnica · University of Stavanger*
