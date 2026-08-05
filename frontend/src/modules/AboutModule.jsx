@@ -3,7 +3,7 @@ import { C } from "../utils/theme.js";
 import { SectionTitle, InfoBanner } from "../components/ui.jsx";
 
 const LICENSE_TEXT = `Program Chair Copilot
-Copyright (c) 2025 Prof. Florenc Demrozi (florenc1991@gmail.com)
+Copyright (c) 2026 Prof. Florenc Demrozi (florenc1991@gmail.com)
 All rights reserved.
 
 NON-COMMERCIAL USE LICENSE
@@ -24,7 +24,10 @@ NON-COMMERCIAL USE LICENSE
 
 3. RESTRICTIONS — YOU MAY NOT:
    a) Use the software for commercial purposes.
-   b) Redistribute, sublicense, sell, rent, lease, or transfer the software.
+   b) Redistribute, sublicense, sell, rent, lease, or transfer the software or
+      any modified version as part of a paid product or service, or for
+      commercial gain. Sharing the original, unmodified repository link is
+      permitted.
    c) Remove, alter, or obscure any copyright notice or author attribution.
    d) Claim ownership of the software or misrepresent its origin.
 
@@ -104,18 +107,38 @@ export function AboutModule({ trialStatus }) {
 
       {/* Author */}
       <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 10, padding: "20px 24px", marginBottom: 14 }}>
-        <SectionTitle>Author</SectionTitle>
+        <SectionTitle>Author & Links</SectionTitle>
         {[
-          ["Name",    "Prof. Florenc Demrozi"],
-          ["Email",   "florenc1991@gmail.com"],
-          ["Version", "1.0.0"],
-          ["Year",    "2025"],
+          ["Author",      "Prof. Florenc Demrozi"],
+          ["Contributor", "Dr. Klevia Dishnica"],
+          ["Email",       "florenc1991@gmail.com"],
+          ["Version",     "1.0.0"],
+          ["Year",        "2026"],
         ].map(([label, value]) => (
           <div key={label} style={{ display: "flex", gap: 16, padding: "7px 0", borderBottom: `1px solid ${C.border}20`, alignItems: "center" }}>
-            <span style={{ fontSize: 11, fontWeight: 700, color: C.muted, width: 80, flexShrink: 0, textTransform: "uppercase", letterSpacing: "0.06em" }}>{label}</span>
-            <span style={{ fontSize: 13, color: C.text, fontFamily: label === "Email" || label === "Version" ? C.mono : C.sans }}>{value}</span>
+            <span style={{ fontSize: 11, fontWeight: 700, color: C.muted, width: 90, flexShrink: 0, textTransform: "uppercase", letterSpacing: "0.06em" }}>{label}</span>
+            <span style={{ fontSize: 13, color: C.text, fontFamily: ["Email","Version"].includes(label) ? C.mono : C.sans }}>{value}</span>
           </div>
         ))}
+        <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 8 }}>
+          {[
+            ["🔗", "GitHub repository", "https://github.com/FlorencDemrozi/pcc"],
+            ["📋", "Feedback form",     "https://forms.cloud.microsoft/e/EeQg7grrF5"],
+            ["🌐", "Project website",   "https://florencdemrozi.github.io/pcc/"],
+          ].map(([icon, label, url]) => (
+            <a key={url} href={url} target="_blank" rel="noreferrer" style={{
+              display: "flex", alignItems: "center", gap: 10, padding: "8px 12px",
+              borderRadius: 7, background: C.panelAlt, border: `1px solid ${C.border}`,
+              textDecoration: "none",
+            }}>
+              <span style={{ fontSize: 15 }}>{icon}</span>
+              <span style={{ fontSize: 12, fontWeight: 600, color: C.accent }}>{label}</span>
+              <span style={{ fontSize: 11, color: C.muted, marginLeft: "auto", fontFamily: C.mono }}>
+                {url.replace("https://", "")}
+              </span>
+            </a>
+          ))}
+        </div>
       </div>
 
       {/* License */}
