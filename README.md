@@ -1,4 +1,4 @@
-# Program Chair Copilot
+# [Program Chair Copilot →](https://florencdemrozi.github.io/pcc/)
 
 > A desktop tool that automates the mechanical work of running an IEEE conference — so you can focus on the science.
 
