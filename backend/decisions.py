@@ -168,9 +168,18 @@ Make a final decision based on these reviews."""
             system=system,
             user_text=user_text,
             max_tokens=800,
+            task="decisions",
         )
         raw = raw.replace("```json", "").replace("```", "").strip()
         result = json.loads(raw)
+        if not isinstance(result, dict):
+            raise ValueError("LLM did not return a JSON object")
+        result["key_strengths"] = _as_list(result.get("key_strengths"))
+        result["key_weaknesses"] = _as_list(result.get("key_weaknesses"))
+        for k in ("decision", "confidence", "rationale", "discussion_reason"):
+            if result.get(k) is None:
+                result[k] = ""
+        result["requires_discussion"] = bool(result.get("requires_discussion"))
         result["paper_id"] = paper["paper_id"]
         result["title"] = paper["title"]
         result["authors"] = paper["authors"]
@@ -194,6 +203,39 @@ Make a final decision based on these reviews."""
         }
 
 
+# ── Export helpers ────────────────────────────────────────────────────────────
+
+def _as_list(v) -> list[str]:
+    """Coerce an LLM field that should be a list of strings (may be None,
+    a single string, or contain non-strings)."""
+    if v is None:
+        return []
+    if isinstance(v, (list, tuple, set)):
+        return [str(x) for x in v if x is not None and str(x).strip()]
+    s = str(v).strip()
+    return [s] if s else []
+
+
+def _join(v, sep: str = "; ") -> str:
+    return sep.join(_as_list(v))
+
+
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r", "\n")
+
+
+def _safe_cell(v):
+    """Neutralise spreadsheet formula injection: strings starting with
+    = + - @ (or control chars) are prefixed with an apostrophe."""
+    if v is None:
+        return ""
+    if isinstance(v, (int, float, bool)):
+        return v
+    s = str(v)
+    if s and s.startswith(_FORMULA_PREFIXES):
+        return "'" + s
+    return s
+
+
 # ── Export to CSV bytes ───────────────────────────────────────────────────────
 
 def decisions_to_csv(decisions: list[dict]) -> bytes:
@@ -211,9 +253,9 @@ def decisions_to_csv(decisions: list[dict]) -> bytes:
     writer.writeheader()
     for d in decisions:
         row = dict(d)
-        row["key_strengths"] = "; ".join(d.get("key_strengths", []))
-        row["key_weaknesses"] = "; ".join(d.get("key_weaknesses", []))
-        writer.writerow(row)
+        row["key_strengths"] = _join(d.get("key_strengths"))
+        row["key_weaknesses"] = _join(d.get("key_weaknesses"))
+        writer.writerow({k: _safe_cell(row.get(k)) for k in fieldnames})
     return buf.getvalue().encode("utf-8-sig")
 
 
@@ -264,11 +306,15 @@ def decisions_to_xlsx(decisions: list[dict]) -> bytes:
             d.get("review_count", ""),
             "Yes" if d.get("requires_discussion") else "No",
             d.get("rationale", ""),
-            "; ".join(d.get("key_strengths", [])),
-            "; ".join(d.get("key_weaknesses", [])),
+            _join(d.get("key_strengths")),
+            _join(d.get("key_weaknesses")),
         ]
         for col, val in enumerate(values, 1):
-            cell = ws.cell(row=row_idx, column=col, value=val)
+            cell = ws.cell(row=row_idx, column=col)
+            safe = _safe_cell(val)
+            cell.value = safe
+            if isinstance(safe, str):
+                cell.data_type = "s"   # never interpret as a formula
             cell.alignment = Alignment(wrap_text=True, vertical="top")
             # Colour the decision cell
             if col == 5:  # Decision column

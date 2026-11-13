@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { C } from "../utils/theme.js";
-import { SectionTitle, InfoBanner } from "../components/ui.jsx";
+import { SectionTitle } from "../components/ui.jsx";
 
 const LICENSE_TEXT = `Program Chair Copilot
 Copyright (c) 2026 Prof. Florenc Demrozi (florenc1991@gmail.com)
@@ -45,7 +45,7 @@ NON-COMMERCIAL USE LICENSE
 7. GOVERNING LAW
    Governed by the laws of the European Union.`;
 
-export function AboutModule({ trialStatus }) {
+export function AboutModule() {
   const [licenseOpen, setLicenseOpen] = useState(false);
 
   return (
@@ -65,45 +65,6 @@ export function AboutModule({ trialStatus }) {
           </div>
         </div>
       </div>
-
-      {/* Trial status */}
-      {trialStatus && (
-        <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 10, padding: "20px 24px", marginBottom: 14 }}>
-          <SectionTitle>License status</SectionTitle>
-          {trialStatus.mode === "development" && <InfoBanner type="info">Development mode — trial not active.</InfoBanner>}
-          {trialStatus.mode === "trial" && (
-            <div>
-              <InfoBanner type={trialStatus.days_remaining <= 7 ? "warning" : "success"}>
-                <strong>Trial active</strong> — {trialStatus.days_remaining} of {trialStatus.trial_days} days remaining.
-                {trialStatus.days_remaining <= 7 && " Re-download soon to continue with full access."}
-              </InfoBanner>
-              <div style={{ height: 6, borderRadius: 3, overflow: "hidden", background: C.border, marginBottom: 12 }}>
-                <div style={{ width: `${Math.round((1 - trialStatus.days_remaining / trialStatus.trial_days) * 100)}%`, height: "100%", background: trialStatus.days_remaining <= 7 ? C.amber : C.green }} />
-              </div>
-              <div style={{ fontSize: 11, color: C.muted }}>Build date: <span style={{ fontFamily: C.mono, color: C.textSoft }}>{trialStatus.build_date}</span></div>
-            </div>
-          )}
-          {trialStatus.mode === "freemium" && (
-            <div>
-              <InfoBanner type="error"><strong>Trial expired.</strong> AI features are disabled. Re-download for a new trial, or contact the author for a full license.</InfoBanner>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 8 }}>
-                <div style={{ background: C.greenDim, border: `1px solid ${C.green}30`, borderRadius: 7, padding: "10px 14px" }}>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: C.greenText, marginBottom: 6 }}>✓ Always free</div>
-                  {["Compliance check", "Review statistics", "COI detection", "Conference config", "Data import"].map(f => (
-                    <div key={f} style={{ fontSize: 12, color: C.textSoft, padding: "2px 0" }}>• {f}</div>
-                  ))}
-                </div>
-                <div style={{ background: C.redDim, border: `1px solid ${C.red}30`, borderRadius: 7, padding: "10px 14px" }}>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: C.redText, marginBottom: 6 }}>🔒 Full license required</div>
-                  {["AI Screening", "Review quality", "Decisions", "Program builder", "Emails & timeline"].map(f => (
-                    <div key={f} style={{ fontSize: 12, color: C.textSoft, padding: "2px 0" }}>• {f}</div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
-      )}
 
       {/* Author */}
       <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 10, padding: "20px 24px", marginBottom: 14 }}>

@@ -1,11 +1,13 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { C, applyTheme, IS } from "./utils/theme.js";
-import { DataSourceBadge, LockedModule } from "./components/ui.jsx";
+import { DataSourceBadge } from "./components/ui.jsx";
+import { loadConferenceConfig, saveConferenceConfig } from "./utils/api.js";
 
 import { DataTab }             from "./modules/DataTab.jsx";
 import { SettingsModule }      from "./modules/SettingsModule.jsx";
 import { ConfigTab }           from "./modules/ConfigTab.jsx";
 import { AboutModule }         from "./modules/AboutModule.jsx";
+import { OverviewModule } from "./modules/OverviewModule.jsx";
 import { ComplianceModule }    from "./modules/ComplianceModule.jsx";
 import { ReviewStatsModule }   from "./modules/ReviewStatsModule.jsx";
 import { ScreeningModule }     from "./modules/ScreeningModule.jsx";
@@ -21,7 +23,8 @@ const PHASES = [
     { id:"settings",  label:"Settings",     icon:"🔑", desc:"LLM provider and API keys" },
     { id:"config",    label:"Conference",    icon:"🏛", desc:"Details, deadlines, tracks. Upload CFP PDF for auto-fill." },
     { id:"data",      label:"Data import",   icon:"📂", desc:"Upload all files once. All modules read from here." },
-    { id:"about",     label:"About",         icon:"ℹ",  desc:"About Program Chair Copilot and licensing information" },
+    { id:"overview",  label:"Overview",      icon:"📈", desc:"Submission statistics: per track, decisions, reviews, countries, keywords." },
+    { id:"about",     label:"About",         icon:"ℹ",  desc:"About Program Chair Copilot and license information" },
   ]},
   { label:"Review", icon:"📋", modules:[
     { id:"compliance",label:"Compliance",    icon:"✅", desc:"Instant PDF checks: pages, fonts, blind compliance, references." },
@@ -41,8 +44,7 @@ const PHASES = [
 ];
 
 const ALL_MODULES   = PHASES.flatMap(p => p.modules);
-const PREMIUM_IDS   = new Set(["screening","reviews","decisions","program","emails"]);
-const TRACK_MODULES = new Set(["compliance","stats","screening","reviews","decisions","coi","program"]);
+const TRACK_MODULES = new Set(["overview","compliance","stats","screening","reviews","decisions","coi","program"]);
 
 const BLANK_CONF = {
   name:"",acronym:"",edition:"",year:"",
@@ -90,6 +92,8 @@ function ThemeBtn({id,icon,label,cur,onChange}){
 
 export default function App(){
   const [activeModule,setActiveModule] = useState("settings");
+  // Modules stay mounted once opened so results and running jobs survive tab switches
+  const [visited,     setVisited]      = useState(()=>new Set(["settings"]));
   const [theme,setTheme] = useState(()=>{try{return localStorage.getItem("pcc-theme")||"dark";}catch{return"dark";}});
 
   const [conf,       setConf]       = useState(BLANK_CONF);
@@ -99,20 +103,40 @@ export default function App(){
   const [tpcRows,    setTpcRows]    = useState([]);
   const [ssRows,     setSsRows]     = useState([]);
   const [authorRows, setAuthorRows] = useState([]);
-  const [trialStatus,setTrialStatus]= useState(null);
   const [activeTrack,setActiveTrack]= useState("All");
+  const [confLoaded, setConfLoaded] = useState(false);
+  const [confSaveError,setConfSaveError] = useState("");
+  const skipFirstSave = useRef(true);
 
   applyTheme(theme);
   const setAndSaveTheme = t => { setTheme(t); try{localStorage.setItem("pcc-theme",t);}catch{} };
 
+  // Load the stored conference config once on startup (never overwrite it with a blank one)
   useEffect(()=>{
-    fetch("/api/config/conference",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(BLANK_CONF)}).catch(()=>{});
-    fetch("/api/trial").then(r=>r.json()).then(setTrialStatus).catch(()=>{});
+    let alive = true;
+    loadConferenceConfig()
+      .then(c=>{ if(alive && c && typeof c==="object" && Object.keys(c).length) setConf({...BLANK_CONF,...c}); })
+      .catch(()=>{})
+      .finally(()=>{ if(alive) setConfLoaded(true); });
+    return ()=>{ alive = false; };
   },[]);
 
-  const isFreemium = trialStatus && !trialStatus.full_access;
-  const daysLeft   = trialStatus?.days_remaining ?? null;
-  const isLocked   = id => isFreemium && PREMIUM_IDS.has(id);
+  // Persist conference config (debounced) after every change — but only after the initial load
+  useEffect(()=>{
+    if(!confLoaded) return;
+    if(skipFirstSave.current){ skipFirstSave.current = false; return; }
+    const t = setTimeout(()=>{
+      saveConferenceConfig(conf)
+        .then(()=>setConfSaveError(""))
+        .catch(e=>setConfSaveError(e.message||"save failed"));
+    },800);
+    return ()=>clearTimeout(t);
+  },[conf,confLoaded]);
+
+  const openModule = id => {
+    setActiveModule(id);
+    setVisited(v => v.has(id) ? v : new Set(v).add(id));
+  };
 
   const availableTracks = metaRows.length
     ? ["All",...[...new Set(metaRows.map(r=>String(r.Track||r.track||"").trim()).filter(Boolean))].sort()]
@@ -134,14 +158,14 @@ export default function App(){
     setAuthorRows([]); setSsRows([]); setConf(BLANK_CONF);
   };
 
-  const renderModule = () => {
-    if(isLocked(activeModule)) return <LockedModule name={activeMod?.label||activeModule}/>;
-    switch(activeModule){
-      case "about":      return <AboutModule trialStatus={trialStatus}/>;
+  const renderModule = id => {
+    switch(id){
+      case "about":      return <AboutModule/>;
       case "settings":   return <SettingsModule/>;
       case "config":     return <ConfigTab conf={conf} setConf={setConf}/>;
       case "data":       return <DataTab pdfFiles={pdfFiles} setPdfFiles={setPdfFiles} metaRows={metaRows} setMetaRows={setMetaRows} reviewRows={reviewRows} setReviewRows={setReviewRows} tpcRows={tpcRows} setTpcRows={setTpcRows} authorRows={authorRows} setAuthorRows={setAuthorRows} ssRows={ssRows} setSsRows={setSsRows}/>;
-      case "compliance": return <ComplianceModule conf={conf} pdfFiles={pdfFiles} metaRows={metaRows} activeTrack={activeTrack}/>;
+      case "overview":   return <OverviewModule conf={conf} metaRows={metaRows} authorRows={authorRows} tpcRows={tpcRows} reviewRows={reviewRows} pdfFiles={pdfFiles} activeTrack={activeTrack}/>;
+      case "compliance": return <ComplianceModule conf={conf} pdfFiles={pdfFiles} metaRows={metaRows} authorRows={authorRows} activeTrack={activeTrack}/>;
       case "stats":      return <ReviewStatsModule reviewRows={reviewRows} metaRows={metaRows} activeTrack={activeTrack}/>;
       case "screening":  return <ScreeningModule conf={conf} pdfFiles={pdfFiles} metaRows={metaRows} activeTrack={activeTrack}/>;
       case "reviews":    return <ReviewQualityModule conf={conf} metaRows={metaRows} reviewRows={reviewRows} activeTrack={activeTrack}/>;
@@ -177,21 +201,9 @@ export default function App(){
         <button onClick={resetSession} style={{padding:"5px 12px",borderRadius:5,fontSize:11,fontWeight:600,cursor:"pointer",border:`1px solid ${C.border}`,background:"transparent",color:C.muted,transition:"all 0.15s"}} title="Clear all data">↺ New session</button>
       </div>
 
-      {/* Trial banners */}
-      {trialStatus?.mode==="trial" && daysLeft<=7 && daysLeft>0 && (
-        <div style={{background:`linear-gradient(90deg,${C.amber}18,${C.amber}08)`,borderBottom:`1px solid ${C.amber}40`,padding:"7px 24px",display:"flex",alignItems:"center",gap:12,fontSize:12}}>
-          <span style={{fontSize:14}}>⏳</span>
-          <span style={{color:C.amber,fontWeight:600}}>{daysLeft} day{daysLeft!==1?"s":""} remaining in your trial.</span>
-          <span style={{color:C.muted}}>Re-download for a new 30-day trial.</span>
-          <a href="mailto:florenc1991@gmail.com" style={{marginLeft:"auto",color:C.accentText,fontWeight:600,textDecoration:"none",fontSize:11}}>Get a license →</a>
-        </div>
-      )}
-      {trialStatus?.mode==="freemium" && (
-        <div style={{background:`linear-gradient(90deg,${C.red}18,${C.red}08)`,borderBottom:`1px solid ${C.red}40`,padding:"7px 24px",display:"flex",alignItems:"center",gap:12,fontSize:12}}>
-          <span style={{fontSize:14}}>🔒</span>
-          <span style={{color:C.redText,fontWeight:600}}>Trial expired.</span>
-          <span style={{color:C.muted}}>Compliance, statistics, and COI are still free. AI features require a full license.</span>
-          <a href="mailto:florenc1991@gmail.com" style={{marginLeft:"auto",color:C.accentText,fontWeight:600,textDecoration:"none",fontSize:11}}>Get a license →</a>
+      {confSaveError && (
+        <div style={{background:`linear-gradient(90deg,${C.red}18,${C.red}08)`,borderBottom:`1px solid ${C.red}40`,padding:"7px 24px",fontSize:12,color:C.redText}}>
+          Could not save the conference configuration: {confSaveError}
         </div>
       )}
 
@@ -209,10 +221,9 @@ export default function App(){
               {phase.modules.map(m=>{
                 const isActive = activeModule===m.id;
                 return(
-                  <div key={m.id} onClick={()=>setActiveModule(m.id)} style={{padding:"7px 18px 7px 22px",cursor:"pointer",display:"flex",gap:9,alignItems:"center",background:isActive?C.accentDim:"transparent",borderLeft:`2px solid ${isActive?C.accent:"transparent"}`,transition:"all 0.12s"}}>
+                  <div key={m.id} onClick={()=>openModule(m.id)} style={{padding:"7px 18px 7px 22px",cursor:"pointer",display:"flex",gap:9,alignItems:"center",background:isActive?C.accentDim:"transparent",borderLeft:`2px solid ${isActive?C.accent:"transparent"}`,transition:"all 0.12s"}}>
                     <span style={{fontSize:13,opacity:isActive?1:0.7}}>{m.icon}</span>
-                    <span style={{fontSize:12,color:isActive?C.accentText:isLocked(m.id)?C.muted:C.textSoft,fontWeight:isActive?600:400}}>{m.label}</span>
-                    {isLocked(m.id)&&<span style={{fontSize:10,marginLeft:"auto",color:C.muted}}>🔒</span>}
+                    <span style={{fontSize:12,color:isActive?C.accentText:C.textSoft,fontWeight:isActive?600:400}}>{m.label}</span>
                   </div>
                 );
               })}
@@ -249,7 +260,11 @@ export default function App(){
               )}
             </div>
           </div>
-          <div style={{padding:"24px 32px"}}>{renderModule()}</div>
+          <div style={{padding:"24px 32px"}}>
+            {ALL_MODULES.filter(m=>visited.has(m.id)).map(m=>(
+              <div key={m.id} style={{display:m.id===activeModule?"block":"none"}}>{renderModule(m.id)}</div>
+            ))}
+          </div>
         </div>
       </div>
     </div>

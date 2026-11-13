@@ -6,7 +6,8 @@ Operates on parsed rows from XLSX/CSV. No LLM calls.
 import re
 from dataclasses import dataclass, field
 from typing import Optional
-from difflib import SequenceMatcher
+import bisect
+from rapidfuzz import fuzz, process
 
 
 @dataclass
@@ -40,8 +41,57 @@ def _word_count(text: str) -> int:
     return len(text.split()) if text.strip() else 0
 
 
+def _norm_title(t: str) -> str:
+    t = re.sub(r"[^\w\s]", " ", (t or "").lower())
+    return re.sub(r"\s+", " ", t).strip()
+
+
 def _title_similarity(a: str, b: str) -> float:
-    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+    """Normalised Indel similarity (0-1) via rapidfuzz (C implementation)."""
+    return fuzz.ratio(_norm_title(a), _norm_title(b)) / 100.0
+
+
+def _find_duplicate_titles(titles: list[dict], threshold: float) -> list[dict]:
+    """Near-duplicate title pairs without a full O(n^2) Python loop.
+
+    Titles are sorted by normalised length; for the Indel ratio
+    2*M/(la+lb) >= t to hold, lb <= la*(2-t)/t, so each title only needs to be
+    compared with the following titles inside that length window. rapidfuzz's
+    score_cutoff lets it bail out early on non-matching pairs.
+    """
+    items = [(_norm_title(t["title"]), t) for t in titles]
+    items = [it for it in items if it[0]]
+    items.sort(key=lambda it: len(it[0]))
+    t = max(min(threshold, 1.0), 0.01)
+    cutoff = t * 100.0
+    max_factor = (2.0 - t) / t
+    out = []
+    n = len(items)
+    norms = [it[0] for it in items]
+    lengths = [len(x) for x in norms]
+    order = {id(t): k for k, t in enumerate(titles)}
+    for i in range(n):
+        na, ta = items[i]
+        # end of the length window (lengths are sorted)
+        end = bisect.bisect_right(lengths, len(na) * max_factor, lo=i + 1)
+        if end <= i + 1:
+            continue
+        # C-level batch scoring of this title against its window
+        for _, sc, j in process.extract(
+            na, norms[i + 1:end], scorer=fuzz.ratio, processor=None,
+            score_cutoff=cutoff, limit=None,
+        ):
+            tb = items[i + 1 + j][1]
+            if sc >= cutoff:
+                # keep original (input) order inside the pair
+                a, b = (ta, tb) if order[id(ta)] < order[id(tb)] else (tb, ta)
+                out.append({
+                    "id_a": a["id"], "title_a": a["title"],
+                    "id_b": b["id"], "title_b": b["title"],
+                    "similarity": round(sc / 100.0, 3),
+                })
+    out.sort(key=lambda d: -d["similarity"])
+    return out
 
 
 # ── main checker ──────────────────────────────────────────────────────────────
@@ -131,22 +181,7 @@ def check_metadata(
         report.per_row.append(per)
 
     # ── duplicate title detection ─────────────────────────────────────────────
-    seen_pairs = set()
-    for i in range(len(titles)):
-        for j in range(i + 1, len(titles)):
-            pair_key = (titles[i]["id"], titles[j]["id"])
-            if pair_key in seen_pairs:
-                continue
-            sim = _title_similarity(titles[i]["title"], titles[j]["title"])
-            if sim >= duplicate_threshold:
-                report.duplicate_titles.append({
-                    "id_a": titles[i]["id"],
-                    "title_a": titles[i]["title"],
-                    "id_b": titles[j]["id"],
-                    "title_b": titles[j]["title"],
-                    "similarity": round(sim, 3),
-                })
-                seen_pairs.add(pair_key)
+    report.duplicate_titles = _find_duplicate_titles(titles, duplicate_threshold)
 
     report.missing_fields_summary = missing_counts
     return report

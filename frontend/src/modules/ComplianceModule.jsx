@@ -2,9 +2,10 @@ import { useState, useEffect } from "react";
 import { C } from "../utils/theme.js";
 import { Badge, StatCard, SectionTitle, ProgressBar, PrimaryButton, GhostButton, EmptyState } from "../components/ui.jsx";
 import { backendPost } from "../utils/api.js";
-import { exportCSV } from "../utils/helpers.js";
+import { exportCSV, trackForFile, knownIdSet } from "../utils/helpers.js";
+import { useRunGuard } from "../utils/useRunGuard.js";
 
-export function ComplianceModule({ conf, pdfFiles, metaRows, activeTrack = "All" }) {
+export function ComplianceModule({ conf, pdfFiles, metaRows, authorRows, activeTrack = "All" }) {
   const [results,      setResults]      = useState([]);
   const [running,      setRunning]      = useState(false);
   const [prog,         setProg]         = useState({ done: 0, total: 0, cur: "" });
@@ -16,18 +17,16 @@ export function ComplianceModule({ conf, pdfFiles, metaRows, activeTrack = "All"
   const [overrides,    setOverrides]    = useState({});
   const [trackFilter,  setTrackFilter]  = useState(activeTrack);
   const [issueFilter,  setIssueFilter]  = useState("All");
+  // Online reference verification (opt-in): { [itemId]: {loading, error, data} }
+  const [refCheck,     setRefCheck]     = useState({});
+  const [verifyAll,    setVerifyAll]    = useState({ running: false, done: 0, total: 0 });
+  const verifyGuard = useRunGuard();
 
   useEffect(() => setTrackFilter(activeTrack), [activeTrack]);
   useEffect(() => () => { if (pdfUrl) URL.revokeObjectURL(pdfUrl); }, []);
 
-  const getTrack = filename => {
-    if (!metaRows.length) return "";
-    const matches = filename.match(/[_\-](\d{4,})/g);
-    if (!matches) return "";
-    const pid = matches[matches.length - 1].replace(/^[_\-]/, "");
-    const row = metaRows.find(r => String(r["#"] || r.paper_id || r.id || "").trim() === pid);
-    return row ? String(row.Track || row.track || "").trim() : "";
-  };
+  const knownIds = knownIdSet(metaRows);
+  const getTrack = filename => trackForFile(filename, metaRows, knownIds);
 
   const openPdf = item => {
     if (pdfUrl) URL.revokeObjectURL(pdfUrl);
@@ -57,6 +56,10 @@ export function ComplianceModule({ conf, pdfFiles, metaRows, activeTrack = "All"
         fd.append("expected_layout",   conf.expectedLayout || "any");
         fd.append("validation_stamp",  conf.validationStamp || "");
         fd.append("use_llm_blind",     String(!skipBlind && useLlmBlind));
+        fd.append("refs_excluded",     String(!!conf.refsExcluded));
+        // Real author names make the double-blind check precise (no guessing).
+        if (!skipBlind && authorRows && authorRows.length > 0)
+          fd.append("author_list_json", JSON.stringify(authorRows));
         const result = await backendPost("/api/check/pdf", fd);
         const track  = getTrack(f.name);
         const failedChecks = [];
@@ -66,6 +69,7 @@ export function ComplianceModule({ conf, pdfFiles, metaRows, activeTrack = "All"
         if (conf.expectedLayout && conf.expectedLayout !== "any" && !result.column_layout?.passed) failedChecks.push("Layout");
         if (!result.references?.passed)                                                  failedChecks.push("Refs");
         if (!result.text_extraction?.passed)                                             failedChecks.push("Text");
+        if (result.citations && result.citations.passed === false)                       failedChecks.push("Cites");
         all.push({ id: i + 1, filename: f.name, track, result, passed: failedChecks.length === 0, failedChecks });
       } catch (e) {
         all.push({ id: i + 1, filename: f.name, track: getTrack(f.name), result: null, error: e.message, passed: false, failedChecks: ["Error"] });
@@ -78,7 +82,75 @@ export function ComplianceModule({ conf, pdfFiles, metaRows, activeTrack = "All"
   const effectivePassed = item => overrides[item.id] ? overrides[item.id] === "Pass" : item.passed;
 
   const allTracks = ["All", ...([...new Set(results.map(r => r.track || "(no track)"))].sort((a, b) => a === "(no track)" ? 1 : b === "(no track)" ? -1 : a.localeCompare(b)))];
-  const ISSUE_TYPES = ["All", "Pages", "Fonts", "Blind", "Layout", "Refs", "Text", "Error"];
+  const ISSUE_TYPES = ["All", "Pages", "Fonts", "Blind", "Layout", "Refs", "Cites", "Text", "Error"];
+
+  // ── Reference verification (Crossref / OpenAlex) ─────────────────────
+  const verifyRefs = async (item, signal) => {
+    const file = pdfFiles.find(f => f.name === item.filename);
+    if (!file) return;
+    setRefCheck(p => ({ ...p, [item.id]: { loading: true } }));
+    try {
+      const fd = new FormData();
+      fd.append("file", file, file.name);
+      fd.append("verify", "true");
+      const data = await backendPost("/api/check/references", fd, { signal });
+      setRefCheck(p => ({ ...p, [item.id]: { data } }));
+    } catch (e) {
+      setRefCheck(p => ({ ...p, [item.id]: { error: e.message } }));
+    }
+  };
+  const runVerifyAll = async () => {
+    const signal = verifyGuard.start();
+    const todo = results.filter(r => r.result && !refCheck[r.id]?.data);
+    setVerifyAll({ running: true, done: 0, total: todo.length });
+    for (let i = 0; i < todo.length; i++) {
+      if (verifyGuard.isCancelled()) break;
+      await verifyRefs(todo[i], signal);
+      setVerifyAll({ running: true, done: i + 1, total: todo.length });
+    }
+    setVerifyAll(v => ({ ...v, running: false }));
+  };
+  const unverifiedCount = id => {
+    const s = refCheck[id]?.data?.verification_summary;
+    return s ? (s.not_found || 0) : null;
+  };
+  const STATUS_LABEL = { verified: "Found", likely: "Probably found", not_found: "Not found \u2014 check manually",
+                         not_checkable: "Not indexed (web/datasheet/standard)", error: "Lookup failed" };
+  const STATUS_COLOR = { verified: C.green, likely: C.amber, not_found: C.red, not_checkable: C.muted, error: C.muted };
+
+  const RefVerifyPanel = ({ item }) => {
+    const st = refCheck[item.id];
+    if (!st) return (
+      <div style={{ marginTop: 6 }}>
+        <GhostButton small onClick={() => verifyRefs(item)}>Verify references online</GhostButton>
+        <div style={{ fontSize: 10, color: C.muted, marginTop: 3 }}>Sends only the reference list entries to Crossref (and OpenAlex if you added its free key in Settings).</div>
+      </div>
+    );
+    if (st.loading) return <div style={{ fontSize: 11, color: C.muted, marginTop: 6 }}>Looking up references...</div>;
+    if (st.error)   return <div style={{ fontSize: 11, color: C.red, marginTop: 6 }}>Verification failed: {st.error}</div>;
+    const d = st.data, sm = d.verification_summary || {};
+    const rows = (d.verification || []).filter(v => v.status !== "verified");
+    return (
+      <div style={{ marginTop: 6 }}>
+        <div style={{ fontSize: 11, color: C.text, marginBottom: 4 }}>
+          References: <strong style={{ color: C.green }}>{sm.verified || 0} found</strong>
+          {sm.likely ? <> · <span style={{ color: C.amber }}>{sm.likely} probable</span></> : null}
+          {sm.not_found ? <> · <span style={{ color: C.red }}>{sm.not_found} not found</span></> : null}
+          {sm.not_checkable ? <> · <span style={{ color: C.muted }}>{sm.not_checkable} not indexed</span></> : null}
+          {sm.error ? <> · <span style={{ color: C.muted }}>{sm.error} failed</span></> : null}
+        </div>
+        {rows.map(v => (
+          <div key={v.n} style={{ fontSize: 10, marginBottom: 3, lineHeight: 1.4 }}>
+            <span style={{ color: STATUS_COLOR[v.status], fontWeight: 600 }}>[{v.n}] {STATUS_LABEL[v.status] || v.status}</span>
+            <span style={{ color: C.muted }}> {"\u2014"} {v.text.slice(0, 160)}{v.text.length > 160 ? "..." : ""}</span>
+            {v.note && v.status !== "not_checkable" && <div style={{ color: C.muted, marginLeft: 10 }}>{v.note}</div>}
+            {v.match && <div style={{ color: C.muted, marginLeft: 10 }}>closest: "{v.match.title}" ({v.match.source}{v.match.year ? ", " + v.match.year : ""})</div>}
+          </div>
+        ))}
+        {sm.not_found > 0 && <div style={{ fontSize: 10, color: C.muted, marginTop: 4 }}>"Not found" does not prove a reference is fake: preprints, theses and books are often missing from these databases.</div>}
+      </div>
+    );
+  };
   const fullPass    = results.filter(r => effectivePassed(r)).length;
 
   const filtered = results.filter(item => {
@@ -168,6 +240,9 @@ export function ComplianceModule({ conf, pdfFiles, metaRows, activeTrack = "All"
         <StatCard label="Issues"     value={results.length - fullPass}    color={C.red} />
         <StatCard label="Overridden" value={Object.keys(overrides).length} color={C.amber} />
         <div style={{ flex: 1 }} />
+        {verifyAll.running
+          ? <GhostButton small onClick={verifyGuard.stop}>Stop verifying ({verifyAll.done}/{verifyAll.total})</GhostButton>
+          : <GhostButton small onClick={runVerifyAll} title="Looks up every reference list entry in Crossref (and OpenAlex if a key is set). Only reference entries are sent.">Verify all references (online)</GhostButton>}
         <GhostButton small onClick={() => run(true)}>Re-run</GhostButton>
         <GhostButton onClick={() => exportCSV(results.map(r => ({
           filename:      r.filename,
@@ -180,6 +255,9 @@ export function ComplianceModule({ conf, pdfFiles, metaRows, activeTrack = "All"
           blind:         skipBlind ? "N/A" : (r.result?.blind_compliance?.passed ? "Pass" : "Fail"),
           layout:        r.result?.column_layout?.value || "N/A",
           references:    r.result?.references?.value || "N/A",
+          citations:     r.result?.citations?.value || "N/A",
+          citation_issues: (r.result?.citations?.issues || []).join(" | "),
+          refs_not_found: unverifiedCount(r.id) ?? "not checked",
           failed_checks: r.failedChecks.join(", "),
         })), "compliance.csv")}>↓ Export CSV</GhostButton>
       </div>
@@ -256,6 +334,11 @@ export function ComplianceModule({ conf, pdfFiles, metaRows, activeTrack = "All"
                         ))}
                       </div>
                     )}
+                    {unverifiedCount(item.id) > 0 && (
+                      <span style={{ display: "inline-block", marginTop: 3, fontSize: 9, padding: "1px 6px", borderRadius: 3, background: C.amber + "20", color: C.amber, fontWeight: 600 }}>
+                        {unverifiedCount(item.id)} ref(s) not found
+                      </span>
+                    )}
                   </div>
                   {r && <span style={{ fontSize: 9, color: C.muted, flexShrink: 0, fontFamily: C.mono }}>{r.raw_pages}p</span>}
                   <span style={{ fontSize: 10, fontWeight: 700, flexShrink: 0, color: isOverride ? C.amber : ok ? C.green : C.red }}>
@@ -279,7 +362,9 @@ export function ComplianceModule({ conf, pdfFiles, metaRows, activeTrack = "All"
                     <CheckRow label="Blind"  check={r.blind_compliance} skipped={skipBlind} />
                     <CheckRow label="Layout" check={r.column_layout} />
                     <CheckRow label="Refs"   check={r.references} />
+                    <CheckRow label="Citations" check={r.citations} />
                     <CheckRow label="Text"   check={r.text_extraction} />
+                    <RefVerifyPanel item={item} />
                     {isOverride && (
                       <div style={{ marginTop: 5, padding: "4px 8px", borderRadius: 4, background: C.amberDim, border: `1px solid ${C.amber}40`, fontSize: 10, color: C.amber }}>
                         ⚠ Override: marked as <strong>{overrides[item.id]}</strong>

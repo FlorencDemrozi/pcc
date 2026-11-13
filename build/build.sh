@@ -22,13 +22,7 @@ npm install --silent
 npm run build
 echo "✓ Frontend built, minified, and obfuscated → frontend/dist/"
 
-# ── 2. Inject build date into trial.py ───────────────────────────────────────
-echo "▶ Injecting build date ($(date +%Y-%m-%d)) into trial.py…"
-cd "$ROOT"
-python build/inject_build_date.py
-echo "✓ Build date injected — trial window starts today"
-
-# ── 3. Install Python dependencies ───────────────────────────────────────────
+# ── 2. Install Python dependencies ───────────────────────────────────────────
 echo "▶ Installing Python dependencies…"
 cd "$ROOT/backend"
 pip install -r requirements.txt pyinstaller --quiet
@@ -44,10 +38,6 @@ pyinstaller build/pcc.spec \
   --workpath build/work \
   --noconfirm \
   --clean
-
-# Restore placeholder so source stays clean
-python build/inject_build_date.py restore
-echo "✓ Source placeholder restored"
 
 echo ""
 echo "══════════════════════════════════════════════"

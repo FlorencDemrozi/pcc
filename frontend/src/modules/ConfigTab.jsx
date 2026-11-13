@@ -137,6 +137,10 @@ export function ConfigTab({ conf, setConf }) {
             <input type="checkbox" id="blind" checked={!!conf.doubleBlind} onChange={e => u("doubleBlind", e.target.checked)} />
             <label htmlFor="blind" style={{ fontSize: 13, color: C.text, cursor: "pointer" }}>Double-blind review</label>
           </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, paddingTop: 20 }}>
+            <input type="checkbox" id="refsx" checked={!!conf.refsExcluded} onChange={e => u("refsExcluded", e.target.checked)} />
+            <label htmlFor="refsx" style={{ fontSize: 13, color: C.text, cursor: "pointer" }}>References don't count toward max pages</label>
+          </div>
           <div>
             <label style={labelStyle}>Expected column layout</label>
             <select style={{ ...inputStyle, cursor: "pointer" }} value={conf.expectedLayout || "any"} onChange={e => u("expectedLayout", e.target.value)}>

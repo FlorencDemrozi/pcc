@@ -70,7 +70,17 @@ export function COIModule({ conf, metaRows, tpcRows, authorRows, activeTrack = "
       <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 14px", marginBottom: 14, display: "flex", gap: 20, flexWrap: "wrap" }}>
         <span style={{ fontSize: 12, color: C.text }}>📂 <strong>{metaRows.length}</strong> papers</span>
         <span style={{ fontSize: 12, color: C.text }}>👥 <strong>{tpcRows.length}</strong> TPC members</span>
-        <span style={{ fontSize: 12, color: C.muted }}>Pairs to check: <strong>{(metaRows.length * tpcRows.length).toLocaleString()}</strong></span>
+        <span style={{ fontSize: 12, color: C.muted }}>Pairs to check: <strong>{(() => {
+          // Same rule as the backend: a PC member with a track is only checked
+          // against papers in that track (they cannot review elsewhere).
+          const tr = r => String(r.Track || r.track || "").trim();
+          let n = 0;
+          for (const t of tpcRows) for (const p of metaRows) {
+            const a = tr(t), b = tr(p);
+            if (!a || !b || a === b) n++;
+          }
+          return n.toLocaleString();
+        })()}</strong> <span style={{ fontSize: 11 }}>(same-track only)</span></span>
       </div>
 
       <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 10, padding: "14px 18px", marginBottom: 14 }}>

@@ -1,9 +1,40 @@
 // ── API helpers ───────────────────────────────────────────────────────────────
 // All fetch calls to the backend live here.
-// callLLM accepts a "task" string so the backend can enforce the correct
-// feature gate (screening / reviews / decisions / program / emails / config).
+// callLLM sends a "task" string (module name) so the backend can pick the
+// fast/full model tier configured for that module.
 
 import { safeParseJSON } from "./helpers.js";
+
+// Task names understood by the backend's model-tier selection (Settings uses the same keys).
+export const TASKS = {
+  screening:     "screening",
+  reviewQuality: "review_quality",
+  decisions:     "decisions",
+  program:       "program",
+  email:         "email",
+  cfpExtract:    "cfp_extract",
+};
+
+// Turn a FastAPI error body ({detail: string | [{msg,...}] | object}) into readable text.
+export function formatErrorDetail(body, status) {
+  const d = body && body.detail;
+  if (typeof d === "string" && d.trim()) return d;
+  if (Array.isArray(d) && d.length) {
+    return d.map(x => (x && (x.msg || x.message)) ? `${(x.loc || []).slice(1).join(".") || "request"}: ${x.msg || x.message}` : JSON.stringify(x)).join("; ");
+  }
+  if (d && typeof d === "object") return d.message || JSON.stringify(d);
+  if (body && typeof body.error === "string") return body.error;
+  return `Server error ${status}`;
+}
+
+export async function errorFromResponse(response) {
+  let body = null;
+  try {
+    const txt = await response.text();
+    try { body = JSON.parse(txt); } catch { body = txt ? { detail: txt.slice(0, 300) } : null; }
+  } catch { /* ignore */ }
+  return new Error(formatErrorDetail(body, response.status));
+}
 
 // ── Core LLM call ─────────────────────────────────────────────────────────────
 
@@ -13,9 +44,11 @@ import { safeParseJSON } from "./helpers.js";
  * @param {string}        systemPrompt
  * @param {string|Array}  userContent  - string or Claude-style content block array
  * @param {number}        maxTokens
- * @param {string}        task         - "screening"|"reviews"|"decisions"|"program"|"emails"|"config"
+ * @param {string}        task         - one of TASKS (module name; selects fast/full model)
+ * @param {{signal?: AbortSignal}} [opts]
  */
-export async function callLLM(systemPrompt, userContent, maxTokens = 1800, task = "screening") {
+export async function callLLM(systemPrompt, userContent, maxTokens = 1800, task, opts = {}) {
+  if (!task) throw new Error("callLLM: task (module name) is required");
   let userText = "";
   let pdfB64   = null;
 
@@ -34,17 +67,24 @@ export async function callLLM(systemPrompt, userContent, maxTokens = 1800, task 
 
   const body = { task, system: systemPrompt, user_text: userText, max_tokens: maxTokens };
   if (pdfB64) body.pdf_b64 = pdfB64;
+  // "text": backend sends the extracted text (cached from the compliance check)
+  // instead of the full PDF — much cheaper, but the model cannot see figures.
+  if (pdfB64 && opts.pdfMode) body.pdf_mode = opts.pdfMode;
 
-  const response = await fetch("/api/llm", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-
-  if (!response.ok) {
-    const err = await response.json().catch(() => ({}));
-    throw new Error(err.detail || `API error ${response.status}`);
+  let response;
+  try {
+    response = await fetch("/api/llm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: opts.signal,
+    });
+  } catch (e) {
+    if (e?.name === "AbortError") throw e;
+    throw new Error(`Cannot reach the backend (${e?.message || "network error"})`, { cause: e });
   }
+
+  if (!response.ok) throw await errorFromResponse(response);
 
   const data = await response.json();
   return data.text || "";
@@ -53,15 +93,14 @@ export async function callLLM(systemPrompt, userContent, maxTokens = 1800, task 
 // Backwards-compat alias used by modules that import "callClaude"
 export const callClaude = callLLM;
 
+export const isAbortError = e => e?.name === "AbortError";
+
 
 // ── Generic backend POST ──────────────────────────────────────────────────────
 
-export async function backendPost(path, formData) {
-  const response = await fetch(path, { method: "POST", body: formData });
-  if (!response.ok) {
-    const err = await response.json().catch(() => ({}));
-    throw new Error(err.detail || `Error ${response.status}`);
-  }
+export async function backendPost(path, formData, opts = {}) {
+  const response = await fetch(path, { method: "POST", body: formData, signal: opts.signal });
+  if (!response.ok) throw await errorFromResponse(response);
   return response.json();
 }
 
@@ -101,18 +140,33 @@ export async function countPagesBackend(fileBlob, filename) {
 
 // ── Conference config ─────────────────────────────────────────────────────────
 
+// Returns the stored conference config object, or null if none/unavailable.
 export async function loadConferenceConfig() {
-  const r = await fetch("/api/config/conference");
-  if (r.ok) return r.json();
+  try {
+    const r = await fetch("/api/config/conference");
+    if (r.ok) {
+      const d = await r.json();
+      return d && typeof d === "object" && !Array.isArray(d) ? d : null;
+    }
+  } catch { /* fall through */ }
+  // Fallback: full config contains a "conference" block
+  try {
+    const r = await fetch("/api/config");
+    if (r.ok) {
+      const d = await r.json();
+      return d && typeof d.conference === "object" ? d.conference : null;
+    }
+  } catch { /* ignore */ }
   return null;
 }
 
 export async function saveConferenceConfig(conf) {
-  await fetch("/api/config/conference", {
+  const r = await fetch("/api/config/conference", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(conf),
   });
+  if (!r.ok) throw await errorFromResponse(r);
 }
 
 
@@ -171,6 +225,6 @@ If a field cannot be determined use null for scalars and [] for arrays.`;
   if (pdfBase64) content.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: pdfBase64 } });
   content.push({ type: "text", text: `${url ? `URL: ${url}\n\n` : ""}Extract ALL conference metadata especially ALL deadline dates and conference event days. Return only the JSON.` });
 
-  const text = await callLLM(system, content, 2000, "config");
+  const text = await callLLM(system, content, 2000, TASKS.cfpExtract);
   return safeParseJSON(text);
 }

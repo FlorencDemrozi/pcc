@@ -28,7 +28,12 @@ class PDFCheckReport:
     text_extraction: CheckResult
     column_layout: CheckResult = field(default_factory=lambda: CheckResult(passed=True))
     references: CheckResult = field(default_factory=lambda: CheckResult(passed=True))
+    citations: CheckResult = field(default_factory=lambda: CheckResult(passed=True, value="Not checked"))
+    reference_entries: list = field(default_factory=list)   # [{"n", "text"}] for online verification
+    reading_text: str = ""       # column-aware full text (cached for cheap LLM screening)
     raw_pages: int = 0
+    body_pages: int = 0          # pages before the references heading
+    reference_pages: int = 0     # references + anything after (appendix)
     raw_text_sample: str = ""
     error: Optional[str] = None
 
@@ -101,6 +106,12 @@ _NAME_STOPWORDS_SINGLE = {
     # Misc false positives seen in practice
     "ground", "truth", "state", "prior", "work", "paper", "study",
     "survey", "review", "report", "note", "letter", "brief",
+    # Template placeholders ("Author One", "Name Surname", "Given Name", "Unknown Authors")
+    "author", "authors", "name", "surname", "given", "family", "unknown",
+    "first", "last", "middle", "one", "two", "three", "four", "five", "six",
+    "anonymous", "affiliation", "institution", "organization", "department",
+    "chair", "institute", "systems", "hardware", "software", "electronic",
+    "embedded", "grenoble", "alpes",
 }
 
 def _is_likely_name(word1: str, word2: str) -> bool:
@@ -144,90 +155,139 @@ def _extract_author_block(page) -> str:
         return (page.extract_text() or "")[:800]
 
 
+def _page_text(page) -> str:
+    try:
+        return page.extract_text() or ""
+    except Exception:
+        return ""
+
+
 def _extract_text(pdf, max_pages: int = 3) -> str:
     """Extract text from first N pages for fast checks."""
-    parts = []
-    for i, page in enumerate(pdf.pages):
-        if i >= max_pages:
-            break
-        t = page.extract_text() or ""
-        parts.append(t)
-    return "\n".join(parts)
+    return "\n".join(_page_text(p) for p in pdf.pages[:max_pages])
 
 
 def _extract_all_text(pdf) -> str:
-    parts = []
-    for page in pdf.pages:
-        t = page.extract_text() or ""
-        parts.append(t)
-    return "\n".join(parts)
+    return "\n".join(_page_text(p) for p in pdf.pages)
 
 
-def _detect_references(pdf) -> tuple[bool, int, list[str]]:
+def _group_lines(words: list[dict], tol: float = 2.5) -> list[list[dict]]:
+    """Group words into visual lines by their 'top' coordinate."""
+    lines: list[list[dict]] = []
+    for w in sorted(words, key=lambda w: (float(w.get("top", 0)), float(w.get("x0", 0)))):
+        top = float(w.get("top", 0))
+        if lines and abs(float(lines[-1][0].get("top", 0)) - top) <= tol:
+            lines[-1].append(w)
+        else:
+            lines.append([w])
+    for ln in lines:
+        ln.sort(key=lambda w: float(w.get("x0", 0)))
+    return lines
+
+
+# Reference-section heading: a whole line, optionally numbered
+# ("References", "REFERENCES", "R E F E R E N C E S", "VII. REFERENCES",
+#  "7 References", "Bibliography", "Literature Cited").
+_REF_HEAD_WORD = (
+    r'(?:R\s?E\s?F\s?E\s?R\s?E\s?N\s?C\s?E\s?S?|References?|Bibliography|BIBLIOGRAPHY'
+    r'|Literature\s+Cited|LITERATURE\s+CITED|Works\s+Cited|WORKS\s+CITED)'
+)
+_REF_NUM_PREFIX = r'(?:(?:[IVXLC]{1,6}|\d{1,2}|[A-Z])\s*[.):]?\s+)?'
+_REF_HEADING_RE = re.compile(
+    r'(?m)^[ \t]*' + _REF_NUM_PREFIX + _REF_HEAD_WORD + r'\b[ \t]*:?[ \t]*$'
+)
+_REF_HEAD_TOKEN_RE = re.compile(r'^' + _REF_HEAD_WORD + r':?$')
+_REF_PREFIX_TOKEN_RE = re.compile(r'^(?:[IVXLC]{1,6}|\d{1,2}|[A-Z])[.):]?$')
+
+
+def _find_ref_heading_on_page(page, text: str) -> Optional[float]:
+    """Return the 'top' (y) of a references heading on this page, or None.
+
+    1. Whole-line regex on the extracted text (single-column / clean extraction).
+    2. Word-level fallback for two-column pages, where extract_text() glues
+       the heading to text of the other column: a heading word with no other
+       word close to it on the same visual line (inside its column).
+    """
+    try:
+        words = page.extract_words() or []
+    except Exception:
+        words = []
+    width = float(getattr(page, "width", 0) or 0) or 612.0
+
+    def _top_of(word_texts: list[str]) -> Optional[float]:
+        for w in words:
+            if _REF_HEAD_TOKEN_RE.match(w["text"]) and w["text"].strip(":") in word_texts:
+                return float(w["top"])
+        return None
+
+    m = _REF_HEADING_RE.search(text or "")
+    if m:
+        heading_word = m.group(0).strip().split()[-1].strip(":")
+        top = _top_of([heading_word])
+        # position unknown → assume mid-page (page still counts as body)
+        return top if top is not None else float(getattr(page, "height", 792) or 792) * 0.5
+
+    if not words:
+        return None
+    for line in _group_lines(words):
+        for idx, w in enumerate(line):
+            if not _REF_HEAD_TOKEN_RE.match(w["text"]):
+                continue
+            # optional numbering token directly before it
+            left = line[:idx]
+            if left and _REF_PREFIX_TOKEN_RE.match(left[-1]["text"]) and \
+                    float(w["x0"]) - float(left[-1]["x1"]) < width * 0.03:
+                left = left[:-1]
+            right = line[idx + 1:]
+            near_left = [x for x in left if float(w["x0"]) - float(x["x1"]) < width * 0.12]
+            near_right = [x for x in right if float(x["x0"]) - float(w["x1"]) < width * 0.12]
+            if not near_left and not near_right:
+                return float(w["top"])
+    return None
+
+
+def _locate_references(pdf, page_texts: list[str]) -> tuple[int, Optional[float]]:
+    """(page index, heading top) of the references heading, or (-1, None).
+    Searches the last 50% of pages first, then the rest."""
+    total = len(pdf.pages)
+    search_from = max(0, int(total * 0.50))
+    for rng in (range(search_from, total), range(0, search_from)):
+        for i in rng:
+            try:
+                top = _find_ref_heading_on_page(pdf.pages[i], page_texts[i])
+            except Exception:
+                top = None
+            if top is not None:
+                return i, top
+    return -1, None
+
+
+def _detect_references(pdf, page_texts: Optional[list[str]] = None) -> tuple[bool, int, list[str]]:
     """
     Detect whether a references section exists and count entries.
 
     Strategy:
-    - Search last 50% of pages for a references heading
+    - Find a references heading (whole line / isolated word), last 50% first
     - Count by finding max reference number in [N] notation (most reliable)
     - Fall back to counting numbered list entries (1. 2. 3.)
     - Fall back to counting author-year blocks as last resort
 
     Returns: (found: bool, count: int, issues: list[str])
     """
-    total_pages = len(pdf.pages)
-    search_from = max(0, int(total_pages * 0.50))  # search last 50% not 40%
-
-    ref_heading_re = re.compile(
-        r'(?:'
-        r'R\s*E\s*F\s*E\s*R\s*E\s*N\s*C\s*E\s*S?'  # spaced caps
-        r'|REFERENCES?'                               # all caps
-        r'|References?'                               # title case
-        r'|Bibliography'
-        r'|BIBLIOGRAPHY'
-        r')',
-        re.MULTILINE,
-    )
-
-    ref_section_text = ""
-    ref_page_found = -1
-
-    for i in range(search_from, total_pages):
-        page_text = pdf.pages[i].extract_text() or ""
-        if ref_heading_re.search(page_text):
-            ref_page_found = i
-            parts = [page_text]
-            for j in range(i + 1, total_pages):
-                parts.append(pdf.pages[j].extract_text() or "")
-            ref_section_text = "\n".join(parts)
-            break
-
-    # Also try searching from page 1 if heading not found in last 50%
-    if ref_page_found == -1:
-        for i in range(0, search_from):
-            page_text = pdf.pages[i].extract_text() or ""
-            if ref_heading_re.search(page_text):
-                ref_page_found = i
-                parts = [page_text]
-                for j in range(i + 1, total_pages):
-                    parts.append(pdf.pages[j].extract_text() or "")
-                ref_section_text = "\n".join(parts)
-                break
-
+    if page_texts is None:
+        page_texts = [_page_text(p) for p in pdf.pages]
+    ref_page_found, _ = _locate_references(pdf, page_texts)
     if ref_page_found == -1:
         return False, 0, ["No references section found"]
+    ref_section_text = "\n".join(page_texts[ref_page_found:])
 
     count = 0
     issues = []
 
     # ── Strategy A: bracketed numbers [N] anywhere in text ───────────────────
-    # Find ALL [N] patterns, take the maximum number found.
-    # This is robust to two-column extraction and line-joining artifacts.
     bracketed_nums = re.findall(r'\[(\d+)\]', ref_section_text)
     if bracketed_nums:
-        int_nums = [int(n) for n in bracketed_nums]
-        max_ref = max(int_nums)
-        # Sanity check: max ref should be reasonable (1-500)
+        max_ref = max(int(n) for n in bracketed_nums)
         if 1 <= max_ref <= 500:
             count = max_ref
 
@@ -235,11 +295,9 @@ def _detect_references(pdf) -> tuple[bool, int, list[str]]:
     if count == 0:
         numbered = re.findall(r'(?m)^\s*(\d{1,3})[.)]\s+\S', ref_section_text)
         if numbered:
-            int_nums = [int(n) for n in numbered]
-            count = max(int_nums) if int_nums else 0
+            count = max(int(n) for n in numbered)
 
-    # ── Strategy C: count lines starting a new reference entry ───────────────
-    # For author-year style: look for lines starting "Lastname, F." or "Lastname F."
+    # ── Strategy C: author-year entries "Lastname, F." at line start ─────────
     if count == 0:
         author_year = re.findall(
             r'(?m)^([A-Z][a-zA-Zàáâãäåæçèéêëìíîïðñòóôõöùúûü\-]{2,},\s+[A-Z])',
@@ -256,16 +314,20 @@ def _detect_references(pdf) -> tuple[bool, int, list[str]]:
 
 def _detect_column_layout(page) -> str:
     """
-    Detect single vs two-column layout using two independent signals.
+    Detect single vs two-column layout.
 
-    Signal 1 — line-span analysis:
-      Reconstruct visual lines from word groups. In a two-column doc most lines
-      end before ~55% of page width (left col) or start after ~47% (right col).
-      In a single-column doc lines span 55-90% of page width.
+    Signal 1 — per-line centre analysis (x-distribution of words):
+      Words are grouped into visual lines. A line is
+        * "spanning" if a word straddles the page centre or the line crosses
+          the centre with only a normal word gap there,
+        * "split" if it has words left of the centre and words right of it
+          separated by a gutter-sized gap (two columns sharing a baseline),
+        * "half" if all its words are on one side of the centre.
+      Two-column pages have almost no spanning lines and a substantial share
+      of lines with content starting right of the centre.
 
-    Signal 2 — character-density gutter:
-      Build a horizontal density histogram of character centres. A two-column
-      doc stored spatially shows a near-zero bin in the centre zone (the gutter).
+    Signal 2 — character-density gutter (fallback):
+      A near-empty vertical band in the centre zone.
 
     Returns: "single", "two-column", or "unknown"
     """
@@ -273,61 +335,411 @@ def _detect_column_layout(page) -> str:
         page_width  = float(page.width)
         page_height = float(page.height)
         top_cutoff  = page_height * 0.12
+        bottom_cutoff = page_height * 0.94
+        centre = page_width * 0.5
+        gutter_min = page_width * 0.015
 
-        # ── Signal 1: line-span analysis ─────────────────────────────────────
         words = page.extract_words()
-        body  = [w for w in words if float(w.get("top", 0)) > top_cutoff]
+        body  = [w for w in words
+                 if top_cutoff < float(w.get("top", 0)) < bottom_cutoff]
         if len(body) < 20:
             return "unknown"
 
-        lines: dict = {}
-        for w in body:
-            key = round(float(w["top"]) / 2) * 2
-            lines.setdefault(key, []).append(w)
-
-        short_lines = 0
-        right_start = 0
-        total_lines = 0
-
-        for ws in lines.values():
-            if len(ws) < 2:
+        spanning = split = left_only = right_only = 0
+        for line in _group_lines(body):
+            if any(float(w["x0"]) < centre < float(w["x1"]) for w in line):
+                spanning += 1
                 continue
-            x0 = min(float(w["x0"]) for w in ws)
-            x1 = max(float(w["x1"]) for w in ws)
-            total_lines += 1
-            if x1 < page_width * 0.55:
-                short_lines += 1
-            if x0 > page_width * 0.47:
-                right_start += 1
+            left = [w for w in line if float(w["x1"]) <= centre]
+            right = [w for w in line if float(w["x0"]) >= centre]
+            if left and right:
+                gap = min(float(w["x0"]) for w in right) - max(float(w["x1"]) for w in left)
+                if gap >= gutter_min:
+                    split += 1
+                else:
+                    spanning += 1
+            elif left:
+                left_only += 1
+            elif right:
+                right_only += 1
 
-        if total_lines >= 5:
-            short_ratio = short_lines / total_lines
-            right_ratio = right_start / total_lines
-            if short_ratio > 0.20 and right_ratio > 0.20:
+        total = spanning + split + left_only + right_only
+        if total >= 8:
+            span_ratio = spanning / total
+            right_ratio = (split + right_only) / total
+            left_ratio = (split + left_only) / total
+            if span_ratio <= 0.25 and right_ratio >= 0.2 and left_ratio >= 0.2:
                 return "two-column"
-            if short_ratio > 0.35:
-                return "two-column"
+            if span_ratio >= 0.5:
+                return "single"
 
         # ── Signal 2: character-density gutter ───────────────────────────────
         chars      = page.chars
-        body_chars = [c for c in chars if float(c.get("top", 0)) > top_cutoff]
+        body_chars = [c for c in chars if top_cutoff < float(c.get("top", 0)) < bottom_cutoff]
         if body_chars:
             N    = 40
             bins = [0] * N
             for c in body_chars:
                 cx = (float(c["x0"]) + float(c["x1"])) / 2
-                b  = min(int((cx / page_width) * N), N - 1)
+                b  = min(max(int((cx / page_width) * N), 0), N - 1)
                 bins[b] += 1
-            zone         = bins[14:26]
-            surround_avg = (sum(bins[8:14]) + sum(bins[26:32])) / 12 if bins else 1
+            zone         = bins[16:24]
+            surround_avg = (sum(bins[8:14]) + sum(bins[26:32])) / 12
             gutter_ratio = min(zone) / surround_avg if surround_avg and zone else 1.0
-            if gutter_ratio < 0.45:
+            if gutter_ratio < 0.15:
                 return "two-column"
 
         return "single"
 
     except Exception:
         return "unknown"
+
+
+# ── Font embedding (font descriptors) ─────────────────────────────────────────
+
+def _resolve(obj, depth: int = 0):
+    try:
+        from pdfminer.pdftypes import resolve1
+        return resolve1(obj)
+    except Exception:
+        return obj
+
+
+def _name_str(v) -> str:
+    v = _resolve(v)
+    if v is None:
+        return ""
+    name = getattr(v, "name", None)
+    if name is not None:
+        return name.decode("latin-1") if isinstance(name, bytes) else str(name)
+    if isinstance(v, bytes):
+        return v.decode("latin-1", errors="ignore")
+    return str(v).lstrip("/")
+
+
+def _font_embedded_status(font) -> Optional[bool]:
+    """True if the font programme is embedded, False if definitely not,
+    None if undeterminable."""
+    font = _resolve(font)
+    if not isinstance(font, dict):
+        return None
+    subtype = _name_str(font.get("Subtype"))
+    if subtype == "Type3":
+        return True                     # glyphs defined inline in the PDF
+    if subtype == "Type0":
+        desc = _resolve(font.get("DescendantFonts"))
+        if isinstance(desc, list) and desc:
+            return _font_embedded_status(desc[0])
+        return None
+    fd = _resolve(font.get("FontDescriptor"))
+    if not isinstance(fd, dict):
+        # Simple font without a descriptor: only legal for the standard 14
+        # fonts, which are by definition not embedded.
+        return False if subtype in ("Type1", "TrueType", "MMType1") else None
+    if any(k in fd for k in ("FontFile", "FontFile2", "FontFile3")):
+        return True
+    return False
+
+
+def _collect_fonts(resources, out: dict, seen: set, depth: int = 0):
+    resources = _resolve(resources)
+    if not isinstance(resources, dict) or depth > 4:
+        return
+    fonts = _resolve(resources.get("Font"))
+    if isinstance(fonts, dict):
+        for ref in fonts.values():
+            key = getattr(ref, "objid", None) or id(ref)
+            if key in seen:
+                continue
+            seen.add(key)
+            f = _resolve(ref)
+            if not isinstance(f, dict):
+                continue
+            name = _name_str(f.get("BaseFont")) or _name_str(f.get("Name")) or "?"
+            status = _font_embedded_status(f)
+            # Keep the "worst" known status per name (False > None > True)
+            prev = out.get(name, "unset")
+            if prev == "unset" or status is False or (status is None and prev is True):
+                out[name] = status
+    xobjs = _resolve(resources.get("XObject"))
+    if isinstance(xobjs, dict):
+        for ref in xobjs.values():
+            key = getattr(ref, "objid", None)
+            if key is not None and ("x", key) in seen:
+                continue
+            if key is not None:
+                seen.add(("x", key))
+            xo = _resolve(ref)
+            attrs = getattr(xo, "attrs", None)
+            if isinstance(attrs, dict) and _name_str(attrs.get("Subtype")) == "Form":
+                _collect_fonts(attrs.get("Resources"), out, seen, depth + 1)
+
+
+def _check_font_embedding(pdf) -> CheckResult:
+    fonts: dict[str, Optional[bool]] = {}
+    seen: set = set()
+    for page in pdf.pages:
+        try:
+            _collect_fonts(page.page_obj.resources, fonts, seen)
+        except Exception:
+            continue
+    if not fonts:
+        # Fall back to the font names pdfplumber saw on characters
+        names = set()
+        for page in pdf.pages:
+            try:
+                for ch in (page.chars or []):
+                    if ch.get("fontname"):
+                        names.add(ch["fontname"])
+            except Exception:
+                pass
+        if names:
+            return CheckResult(passed=True, value=f"{len(names)} font(s); could not verify embedding")
+        return CheckResult(passed=True, value="No font data found (image-based PDF)")
+
+    embedded = [n for n, s in fonts.items() if s is True]
+    missing = [n for n, s in fonts.items() if s is False]
+    unknown = [n for n, s in fonts.items() if s is None]
+    if missing:
+        return CheckResult(
+            passed=False,
+            value=f"{len(embedded)} embedded, {len(missing)} not embedded",
+            issues=[f"Non-embedded fonts: {', '.join(sorted(missing)[:5])}"],
+        )
+    value = f"{len(embedded)} font(s), all embedded"
+    if unknown:
+        value = f"{len(embedded)} embedded, {len(unknown)} undetermined"
+    return CheckResult(passed=True, value=value)
+
+
+# ── Identity helpers ──────────────────────────────────────────────────────────
+
+_ANON_MARKERS = (
+    "anonymous author", "anonymous authors", "anonymous affiliation",
+    "anonymous institution", "anonymous email", "anonymous submission",
+    "anonymized for review", "anonymised for review", "anonymized for submission",
+    "anonymised for submission", "author name", "author names",
+    "author affiliation", "authors omitted", "blind review", "double-blind review",
+    "name withheld", "withheld for review",
+)
+_SOFTWARE_WORDS = re.compile(
+    r'(?i)latex|tex\b|pdftex|xetex|luatex|dvips|dvipdf|word|office|acrobat|'
+    r'distiller|pdf|writer|overleaf|ghostscript|quartz|chrome|skia|cairo|'
+    r'libreoffice|openoffice|microsoft|adobe|windows|mac\s?os|google|apple|'
+    r'printer|pages|keynote|powerpoint|inkscape|matplotlib|elsevier|ieee|acm|springer'
+)
+_GENERIC_AUTHOR_META = {
+    "", "anonymous", "anonymous author", "anonymous authors", "author",
+    "authors", "user", "admin", "administrator", "owner", "unknown", "ieee",
+    "acm", "none", "n/a", "na", "-", "default", "windows user", "microsoft office user",
+}
+
+
+# Template / placeholder e-mails ("name.surname@xxx.xx", "email1@example.com",
+# "anonym@anonym.anonym") are not identity leaks.
+_PLACEHOLDER_EMAIL_RE = re.compile(
+    r'(example\.(com|org|net)|@x+\.|\bxxx|anonym|^name[._]?surname@|^first[._]?last@|'
+    r'^email\d*@|^author\d*@|^someone@|^user@|@(domain|email|university|institution|affiliation)\.)',
+    re.IGNORECASE,
+)
+
+
+def _is_placeholder_email(addr: str) -> bool:
+    return bool(_PLACEHOLDER_EMAIL_RE.search(addr))
+
+
+_ABSTRACT_LINE_RE = re.compile(r'^\s*(abstract|index\s+terms|keywords)\b', re.IGNORECASE)
+
+
+def _author_block_lines(page, frac: float = 0.40) -> list[str]:
+    """Lines between the title and the abstract on page 1 (where authors go).
+
+    The title is taken as the lines set in the largest font in the top zone;
+    the block ends at the first line starting with "Abstract"/"Index Terms".
+    Restricting the "looks like a name" heuristic to this block avoids flagging
+    title-case phrases from the title or abstract ("Random Forest").
+    """
+    try:
+        words = page.extract_words(extra_attrs=["size"]) or []
+    except Exception:
+        return _top_zone_lines(page, frac)
+    cutoff = float(page.height) * frac
+    zone = [w for w in words if float(w.get("top", 0)) <= cutoff]
+    if not zone:
+        return []
+    lines = _group_lines(zone)
+    max_size = max(float(w.get("size", 0) or 0) for w in zone)
+    def _lsize(ln):
+        return sum(float(w.get("size", 0) or 0) for w in ln) / max(len(ln), 1)
+    title_idx = [i for i, ln in enumerate(lines) if _lsize(ln) >= max_size * 0.9]
+    start = (max(title_idx) + 1) if title_idx else 0
+    out = []
+    for ln in lines[start:]:
+        text = " ".join(w["text"] for w in ln)
+        if _ABSTRACT_LINE_RE.match(text):
+            break
+        out.append(text)
+    return out
+
+
+def _known_author_hits(text: str, author_names: list[str]) -> list[str]:
+    """Return known author names (from the EasyChair author list) found in text."""
+    import unicodedata
+    def _fold(s: str) -> str:
+        return "".join(c for c in unicodedata.normalize("NFKD", s.lower())
+                       if not unicodedata.combining(c))
+    found = []
+    low = _fold(text)
+    for name in author_names or []:
+        parts = [p for p in re.split(r'\s+', _fold(name.strip())) if p]
+        if len(parts) < 2:
+            continue
+        first, last = re.escape(parts[0]), re.escape(parts[-1])
+        # Letter boundaries (not \b) so "Santhosh1" / "Kaja*" with affiliation
+        # superscripts still match; allow middle names/initials in between.
+        # A single trailing letter a-h before a separator is a superscript
+        # affiliation mark ("Santhosha, ..." = Santhosh + affiliation a);
+        # "Liu" must not match "Li", so u and later letters are excluded.
+        if re.search(rf'(?<![a-z]){first}(?![a-z])(?:\s+\S+){{0,2}}\s+{last}(?:[a-h](?=[,;*\d\n]|$))?(?![a-z])', low):
+            found.append(name.strip())
+    return found
+
+
+def _top_zone_lines(page, frac: float = 0.30) -> list[str]:
+    try:
+        words = page.extract_words() or []
+    except Exception:
+        words = []
+    cutoff = float(page.height) * frac
+    zone = [w for w in words if float(w.get("top", 0)) <= cutoff]
+    return [" ".join(w["text"] for w in ln) for ln in _group_lines(zone)]
+
+
+def _decode_meta(v) -> str:
+    v = _resolve(v)
+    if isinstance(v, bytes):
+        try:
+            if v.startswith(b"\xfe\xff"):
+                return v[2:].decode("utf-16-be", errors="ignore")
+            return v.decode("utf-8")
+        except Exception:
+            return v.decode("latin-1", errors="ignore")
+    return "" if v is None else str(v)
+
+
+def _metadata_identity_hits(pdf) -> list[str]:
+    hits = []
+    try:
+        meta = pdf.metadata or {}
+    except Exception:
+        meta = {}
+    for key, raw in meta.items():
+        val = _decode_meta(raw).strip()
+        if not val:
+            continue
+        for m in _EMAIL_RE.finditer(val):
+            hits.append(f"Email in PDF metadata ({key}): {m.group(0)}")
+        if key == "Author":
+            if val.strip().lower() not in _GENERIC_AUTHOR_META and "anonym" not in val.lower():
+                hits.append(f"PDF metadata Author field: \"{val[:60]}\"")
+        elif key == "Creator":
+            if not _SOFTWARE_WORDS.search(val):
+                for m in _NAME_RE.finditer(val):
+                    if _is_likely_name(m.group(1), m.group(2)):
+                        hits.append(f"PDF metadata Creator field looks like a name: \"{val[:60]}\"")
+                        break
+    return list(dict.fromkeys(hits))
+
+
+def _strip_accents(s: str) -> str:
+    import unicodedata
+    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+
+
+def _author_on_page(name: str, page_text_norm: str) -> bool:
+    """True if `name` appears on the page: surname as a whole word AND the
+    first name (whole word) or its initial ("J." / "J.-P.") close before it,
+    or "Surname, First/F." order. page_text_norm must be accent-stripped."""
+    toks = re.findall(r"[A-Za-z][A-Za-z'\-]*", _strip_accents(name or ""))
+    if not toks:
+        return False
+    if len(toks) == 1:
+        return re.search(r'\b' + re.escape(toks[0]) + r'\b', page_text_norm, re.IGNORECASE) is not None
+    first, last = toks[0], toks[-1]
+    sur = re.escape(last)
+    fi = re.escape(first[0])
+    fn = re.escape(first)
+    patterns = [
+        # First [Middle/initials] Surname (within ~40 chars)
+        rf'\b{fn}\b[^\n]{{0,40}}?\b{sur}\b',
+        # J. Surname / J.-P. Surname / J. K. Surname
+        rf'\b{fi}\.(?:\s*-?\s*[A-Z]\.)*\s*(?:[A-Z][a-z]+\s+)?{sur}\b',
+        # Surname, First / Surname, J.
+        rf'\b{sur},\s*(?:{fn}\b|{fi}\.)',
+    ]
+    return any(re.search(p, page_text_norm, re.IGNORECASE) for p in patterns)
+
+
+# ── PDF eXpress stamp ─────────────────────────────────────────────────────────
+
+# Explicit eXpress / compliance phrases only — a bare "IEEE Xplore" occurs in
+# countless reference lists and must not count.
+_STAMP_PATTERNS = [
+    r'IEEE\s*PDF\s*e?Xpress',
+    r'PDF\s*e?Xpress',
+    r'Certified\s+by\s+IEEE\s*PDF',
+    r'IEEE\s+Xplore[\s\-]+[Cc]ompatib\w*',
+    r'Xplore[\s\-]+[Cc]ompliant',
+]
+
+
+def _header_footer_text(page, frac: float = 0.08) -> str:
+    try:
+        words = page.extract_words() or []
+    except Exception:
+        return ""
+    h = float(page.height)
+    return " ".join(w["text"] for w in words
+                    if float(w.get("top", 0)) <= h * frac or float(w.get("bottom", 0)) >= h * (1 - frac))
+
+
+def _find_stamp(pdf, file_bytes: bytes, extra: str = "") -> tuple[bool, str, str]:
+    patterns = list(_STAMP_PATTERNS)
+    if extra and extra.strip():
+        patterns.insert(0, re.escape(extra.strip()))
+
+    def _search(text: str):
+        for pattern in patterns:
+            m = re.search(pattern, text, re.IGNORECASE)
+            if m:
+                s, e = max(0, m.start() - 10), min(len(text), m.end() + 40)
+                return text[s:e].strip()
+        return None
+
+    # 1. Document info dictionary
+    try:
+        meta = pdf.metadata or {}
+        meta_str = " ".join(_decode_meta(v) for v in meta.values() if v)
+        hit = _search(meta_str)
+        if hit:
+            return True, "PDF metadata", hit
+    except Exception:
+        pass
+    # 2. XMP metadata packets only (not arbitrary content streams)
+    try:
+        raw = file_bytes.decode("latin-1", errors="ignore")
+        for m in re.finditer(r'<x:xmpmeta.*?</x:xmpmeta>', raw, re.DOTALL | re.IGNORECASE):
+            hit = _search(m.group(0))
+            if hit:
+                return True, "XMP metadata", hit[:80]
+    except Exception:
+        pass
+    # 3. Header / footer zones of the pages (where a stamp would be printed)
+    for page in pdf.pages:
+        hit = _search(_header_footer_text(page))
+        if hit:
+            return True, "page header/footer", hit
+    return False, "", ""
 
 
 # ── main checker ──────────────────────────────────────────────────────────────
@@ -384,6 +796,17 @@ If violations found:
     }
 
 
+_CHECK_FIELDS = (
+    "page_count", "font_embedding", "blind_compliance", "author_info_present",
+    "copyright_notice", "pdf_express", "text_extraction", "column_layout", "references",
+)
+
+
+def _fail_all(report: PDFCheckReport, value: str, issue: str) -> None:
+    for f in _CHECK_FIELDS:
+        setattr(report, f, CheckResult(passed=False, value=value, issues=[issue]))
+
+
 def check_pdf(
     file_bytes: bytes,
     filename: str,
@@ -395,6 +818,7 @@ def check_pdf(
     validation_stamp: str = "",
     use_llm_blind: bool = False,
     author_names: list[str] = None,
+    refs_excluded: bool = False,
 ) -> PDFCheckReport:
     """
     Run all deterministic checks on a PDF.
@@ -407,9 +831,16 @@ def check_pdf(
         copyright_strings: List of acceptable copyright notice strings to search for
         check_camera_ready: If True, flip blind logic — authors SHOULD be present
         expected_layout:   "single", "two-column", or "any" (no check)
+        validation_stamp:  Optional extra stamp text to accept as PDF eXpress proof
+        refs_excluded:     If True, the page limit applies to body pages only
+                           (pages before the references heading)
+
+    Never raises: unreadable / encrypted PDFs and failures inside individual
+    checks are reported in the result instead of aborting a batch.
     """
     import io
 
+    copyright_strings = copyright_strings or []
     report = PDFCheckReport(
         filename=filename,
         page_count=CheckResult(passed=False),
@@ -422,103 +853,112 @@ def check_pdf(
     )
 
     try:
-        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        pdf = pdfplumber.open(io.BytesIO(file_bytes))
+        n = len(pdf.pages)          # forces parsing of the page tree
+    except Exception as e:
+        msg = str(e) or e.__class__.__name__
+        _fail_all(report, "Could not open (encrypted/corrupt)",
+                  f"PDF could not be opened — it may be encrypted, password-protected or corrupt ({msg[:120]})")
+        report.error = f"Could not open (encrypted/corrupt): {msg[:200]}"
+        return report
 
-            # ── page count ────────────────────────────────────────────────────
-            n = len(pdf.pages)
+    def _run(field_name: str, fn):
+        """Run one check; on failure record it in that check only."""
+        try:
+            fn()
+        except Exception as e:
+            setattr(report, field_name, CheckResult(
+                passed=False, value="Check failed",
+                issues=[f"Could not run this check: {str(e)[:150] or e.__class__.__name__}"],
+            ))
+
+    try:
+        with pdf:
             report.raw_pages = n
-            passed = n <= max_pages
-            report.page_count = CheckResult(
-                passed=passed,
-                value=str(n),
-                issues=[] if passed else [f"{n} pages exceeds limit of {max_pages}"]
-            )
+            page_texts = [_page_text(p) for p in pdf.pages]
+            all_text = "\n".join(page_texts)
+            first_page = pdf.pages[0] if n else None
+            first_page_text = page_texts[0] if n else ""
+            p1_has_text = len(first_page_text.strip()) >= 20
+
+            # ── page count (total, body, references/appendix) ─────────────────
+            def _page_count():
+                ref_idx, ref_top = _locate_references(pdf, page_texts)
+                if ref_idx >= 0:
+                    page_h = float(pdf.pages[ref_idx].height or 792)
+                    heading_at_top = ref_top is not None and ref_top <= page_h * 0.15
+                    report.body_pages = ref_idx + (0 if heading_at_top else 1)
+                else:
+                    report.body_pages = n
+                report.reference_pages = n - report.body_pages
+                counted = report.body_pages if refs_excluded else n
+                passed = counted <= max_pages
+                issues = []
+                if not passed:
+                    if refs_excluded:
+                        issues.append(f"{counted} body pages (excluding references) exceed limit of {max_pages}")
+                    else:
+                        issues.append(f"{n} pages exceeds limit of {max_pages}")
+                report.page_count = CheckResult(passed=passed, value=str(n), issues=issues)
+            _run("page_count", _page_count)
 
             # ── text extraction ───────────────────────────────────────────────
-            first_text = _extract_text(pdf, max_pages=3)
-            all_text = _extract_all_text(pdf)
-            report.raw_text_sample = all_text[:500]
-            has_text = len(all_text.strip()) > 100
-            report.text_extraction = CheckResult(
-                passed=has_text,
-                value=f"{len(all_text)} chars extracted",
-                issues=[] if has_text else ["PDF appears to be scanned or image-only — text extraction failed"]
-            )
-
-            # ── font embedding ────────────────────────────────────────────────
-            # Check via page chars — embedded subset fonts have "+" prefix (e.g. ABCDEF+Arial)
-            try:
-                embedded = []
-                not_embedded = []
-                seen = set()
-                for page in pdf.pages:
-                    for char in (page.chars or []):
-                        fname = char.get("fontname", "")
-                        if fname and fname not in seen:
-                            seen.add(fname)
-                            if "+" in fname:
-                                embedded.append(fname)
-                            else:
-                                not_embedded.append(fname)
-                if not_embedded:
-                    report.font_embedding = CheckResult(
-                        passed=False,
-                        value=f"{len(embedded)} embedded, {len(not_embedded)} not embedded",
-                        issues=[f"Non-embedded fonts: {', '.join(not_embedded[:5])}"]
-                    )
-                elif embedded or seen:
-                    report.font_embedding = CheckResult(
-                        passed=True,
-                        value=f"{len(embedded)} font(s), all embedded",
-                    )
-                else:
-                    report.font_embedding = CheckResult(
-                        passed=True,
-                        value="No font data found (image-based PDF)",
-                    )
-            except Exception as e:
-                report.font_embedding = CheckResult(
-                    passed=True,
-                    value="Could not verify font embedding",
-                    issues=[]  # don't show error text to user — it's a library version issue
+            def _text_extraction():
+                report.raw_text_sample = all_text[:500]
+                has_text = len(all_text.strip()) > 100
+                empty_pages = sum(1 for t in page_texts if len(t.strip()) < 20)
+                issues = [] if has_text else ["PDF appears to be scanned or image-only — text extraction failed"]
+                if has_text and empty_pages:
+                    issues.append(f"{empty_pages} page(s) have no extractable text (scanned/image pages?)")
+                report.text_extraction = CheckResult(
+                    passed=has_text,
+                    value=f"{len(all_text)} chars extracted",
+                    issues=issues,
                 )
+            _run("text_extraction", _text_extraction)
+
+            # ── font embedding (font descriptors: FontFile/FontFile2/FontFile3) ─
+            def _fonts():
+                report.font_embedding = _check_font_embedding(pdf)
+            _run("font_embedding", _fonts)
 
             # ── blind compliance (submission) ─────────────────────────────────
-            if double_blind and not check_camera_ready:
-
-                if use_llm_blind:
-                    # LLM-based check runs asynchronously — stored for caller to await
-                    first_page_text = pdf.pages[0].extract_text() or ""
-                    report._llm_blind_pending = (first_page_text, filename)
-                else:
-                    hits = []
-                    # Extract only the author header zone (top 30% of page 1)
-                    author_block = _extract_author_block(pdf.pages[0])
-
-                    # Skip page text scan if paper uses standard anonymisation placeholders
-                    anon_markers = ["anonymous author", "anonymous affiliation",
-                                    "anonymous email", "anonymized", "anonymised",
-                                    "author name", "author affiliation"]
-                    block_lower = author_block.lower()
-                    is_anonymised = any(m in block_lower for m in anon_markers)
-
-                    if not is_anonymised:
-                        # Email addresses
-                        for m in _EMAIL_RE.finditer(author_block):
+            def _blind():
+                if not (double_blind and not check_camera_ready):
+                    report.blind_compliance = CheckResult(passed=True, value="Not required")
+                    return
+                hits: list[str] = []
+                # Always: metadata (Author/Creator/e-mails)
+                hits += _metadata_identity_hits(pdf)
+                if first_page is not None and p1_has_text:
+                    zone_lines = _top_zone_lines(first_page, 0.30)
+                    author_block = " ".join(zone_lines)
+                    # Anonymisation placeholders only suppress the weak
+                    # "looks like a person's name" heuristic.
+                    is_anonymised = any(
+                        any(mk in ln.lower() for mk in _ANON_MARKERS) for ln in zone_lines
+                    )
+                    # Always: real author names from the author list (strongest signal)
+                    known = _known_author_hits(first_page_text, author_names or [])
+                    if known:
+                        hits.append(f"Author name(s) from author list: {', '.join(known[:3])}")
+                    # Always: e-mails anywhere on page 1 (not template placeholders), ORCID in header
+                    for m in _EMAIL_RE.finditer(first_page_text):
+                        if not _is_placeholder_email(m.group(0)):
                             hits.append(f"Email: {m.group(0)}")
-
-                        # ORCID
-                        if _ORCID_RE.search(author_block):
-                            hits.append("ORCID identifier found")
-
-                        # Affiliation keywords
-                        aff_matches = _AFF_RE.findall(author_block)
-                        if aff_matches:
-                            hits.append(f"Affiliation keyword: '{aff_matches[0]}'")
-
-                        # Name-like patterns
+                    if _ORCID_RE.search(author_block):
+                        hits.append("ORCID identifier found")
+                    # Affiliation keywords in header lines (skip placeholder lines)
+                    for ln in zone_lines:
+                        if "anonym" in ln.lower():
+                            continue
+                        mm = _AFF_RE.search(ln)
+                        if mm:
+                            hits.append(f"Affiliation keyword: '{mm.group(0)}'")
+                            break
+                    if not is_anonymised and not known:
                         name_hits = []
-                        for m in _NAME_RE.finditer(author_block):
+                        for m in _NAME_RE.finditer(" ".join(_author_block_lines(first_page))):
                             if _is_likely_name(m.group(1), m.group(2)):
                                 name_hits.append(f"{m.group(1)} {m.group(2)}")
                             if len(name_hits) >= 3:
@@ -526,290 +966,201 @@ def check_pdf(
                         if name_hits:
                             hits.append(f"Possible author name(s): {', '.join(name_hits[:3])}")
 
-                        # Also scan full first page text for emails
-                        first_page_text = pdf.pages[0].extract_text() or ""
-                        for m in _EMAIL_RE.finditer(first_page_text):
-                            email_hit = f"Email: {m.group(0)}"
-                            if email_hit not in hits:
-                                hits.append(email_hit)
-                                break
+                hits = list(dict.fromkeys(hits))[:6]
+                report._det_blind_hits = hits
 
-                    hits = list(dict.fromkeys(hits))[:5]
-                    passed = len(hits) == 0
+                if use_llm_blind:
+                    # LLM check runs in check_pdf_async; deterministic hits are merged there
+                    report._llm_blind_pending = (first_page_text, filename)
+
+                if hits:
                     report.blind_compliance = CheckResult(
-                        passed=passed,
-                        value="Clean" if passed else f"{len(hits)} identity signal(s) detected",
-                        issues=hits if hits else []
+                        passed=False, value=f"{len(hits)} identity signal(s) detected", issues=hits,
                     )
-            else:
-                report.blind_compliance = CheckResult(
-                    passed=True,
-                    value="Not required",
-                )
+                elif first_page is None or not p1_has_text:
+                    report.blind_compliance = CheckResult(
+                        passed=False, value="Could not verify (no text layer)",
+                        issues=["Page 1 has no extractable text (scanned/image PDF) — check anonymisation manually"],
+                    )
+                else:
+                    report.blind_compliance = CheckResult(passed=True, value="Clean")
+            _run("blind_compliance", _blind)
 
-            # ── author info present (camera-ready) ────────────────────────────
-            if check_camera_ready:
-                # For camera-ready, authors SHOULD be present in the header area
-                author_block = _extract_author_block(pdf.pages[0])
-                first_page_text = pdf.pages[0].extract_text() or ""
-
-                has_email = bool(_EMAIL_RE.search(first_page_text))
-                has_orcid = bool(_ORCID_RE.search(author_block))
-                has_affiliation = bool(_AFF_RE.search(author_block))
-                has_name = bool(_NAME_RE.search(author_block))
-
-                passed = has_email or has_affiliation or has_orcid or has_name
-                signals = []
-                if has_email:      signals.append("email found")
-                if has_affiliation: signals.append("affiliation found")
-                if has_orcid:      signals.append("ORCID found")
-                if has_name:       signals.append("author name found")
-
-                report.author_info_present = CheckResult(
-                    passed=passed,
-                    value=", ".join(signals) if signals else "Not found",
-                    issues=[] if passed else [
-                        "No author name, affiliation, email, or ORCID detected on page 1 — verify author info is included"
-                    ]
-                )
-            else:
-                report.author_info_present = CheckResult(
-                    passed=True,
-                    value="N/A (submission mode)",
-                )
-
-            # ── copyright notice (bottom-left of page 1) ──────────────────────
-            if check_camera_ready and copyright_strings:
-                found_notice = None
-                found_in_footer = False
-
-                # Extract the bottom 15% of page 1 — that's where IEEE copyright goes
-                p1 = pdf.pages[0]
-                footer_y_threshold = p1.height * 0.85  # bottom 15%
+            # ── copyright notice (bottom of page 1) ───────────────────────────
+            def _copyright():
+                if not check_camera_ready:
+                    report.copyright_notice = CheckResult(passed=True, value="N/A (submission mode)")
+                    return
+                if not copyright_strings:
+                    report.copyright_notice = CheckResult(passed=True, value="No notices configured")
+                    return
+                if first_page is None or not p1_has_text:
+                    report.copyright_notice = CheckResult(
+                        passed=False, value="Could not verify (no text layer)",
+                        issues=["Page 1 has no extractable text — check the copyright notice manually"],
+                    )
+                    return
+                p1 = first_page
+                footer_y_threshold = p1.height * 0.85
                 try:
-                    footer_words = p1.extract_words()
                     footer_text = " ".join(
-                        w["text"] for w in footer_words
+                        w["text"] for w in p1.extract_words()
                         if w.get("top", 0) >= footer_y_threshold
                     ).lower()
                 except Exception:
                     footer_text = ""
-
-                # Also check full page text as fallback
-                full_p1 = (p1.extract_text() or "").lower()
-
+                full_p1 = first_page_text.lower()
+                found_notice, found_in_footer = None, False
                 for notice in copyright_strings:
-                    # Fuzzy check: require at least the key tokens to match
-                    key_tokens = [t for t in re.split(r'\s+', notice.lower()) if len(t) > 3]
+                    key_tokens = [t for t in re.split(r'\s+', str(notice).lower()) if len(t) > 3]
                     matched_tokens = sum(1 for t in key_tokens if t in full_p1)
                     if key_tokens and matched_tokens >= max(1, len(key_tokens) * 0.6):
-                        found_notice = notice
-                        # Check if it's specifically in the footer
+                        found_notice = str(notice)
                         footer_tokens = sum(1 for t in key_tokens if t in footer_text)
                         found_in_footer = footer_tokens >= max(1, len(key_tokens) * 0.5)
                         break
-
                 if found_notice:
                     location = "footer (bottom-left)" if found_in_footer else "page 1 (not in footer)"
                     report.copyright_notice = CheckResult(
-                        passed=True,
-                        value=f"Found in {location}: {found_notice[:60]}",
+                        passed=True, value=f"Found in {location}: {found_notice[:60]}",
                     )
                 else:
                     report.copyright_notice = CheckResult(
-                        passed=False,
-                        value="Not found on page 1",
+                        passed=False, value="Not found on page 1",
                         issues=[
                             f"Copyright notice not found on first page. "
-                            f"Expected one of: {'; '.join(n[:40] for n in copyright_strings[:3])}"
-                        ]
+                            f"Expected one of: {'; '.join(str(x)[:40] for x in copyright_strings[:3])}"
+                        ],
                     )
-            elif not check_camera_ready:
-                report.copyright_notice = CheckResult(passed=True, value="N/A (submission mode)")
-            else:
-                report.copyright_notice = CheckResult(passed=True, value="No notices configured")
+            _run("copyright_notice", _copyright)
 
-            # ── IEEE PDF eXpress validation stamp (metadata) ───────────────────
-            STAMP_PATTERNS = [
-                r'IEEE\s+PDF\s*[Ee]xpress',
-                r'PDFExpress',
-                r'PDF\s+[Ee]xpress',
-                r'Certified\s+by\s+IEEE',
-                r'Xplore\s+[Cc]ompatib',
-                r'IEEE\s+Xplore',
-            ]
-            found_stamp = False
-            stamp_source = ""
-            stamp_value = ""
-
-            # Check metadata first (most reliable — appears in File → Properties)
-            try:
-                meta = pdf.metadata or {}
-                meta_str = " ".join(str(v) for v in meta.values() if v)
-                for pattern in STAMP_PATTERNS:
-                    m = re.search(pattern, meta_str, re.IGNORECASE)
-                    if m:
-                        found_stamp = True
-                        stamp_source = "PDF metadata"
-                        # Extract surrounding context (up to 80 chars)
-                        start = max(0, m.start() - 10)
-                        end   = min(len(meta_str), m.end() + 40)
-                        stamp_value = meta_str[start:end].strip()
-                        break
-            except Exception:
-                pass
-
-            # Also check XMP metadata via raw PDF bytes
-            if not found_stamp:
-                try:
-                    raw = file_bytes.decode('latin-1', errors='ignore')
-                    for pattern in STAMP_PATTERNS:
-                        m = re.search(pattern, raw, re.IGNORECASE)
-                        if m:
-                            found_stamp = True
-                            stamp_source = "XMP metadata"
-                            start = max(0, m.start() - 10)
-                            end   = min(len(raw), m.end() + 40)
-                            stamp_value = raw[start:end].strip()[:80]
-                            break
-                except Exception:
-                    pass
-
-            # Also check page text as last resort
-            if not found_stamp:
-                for pattern in STAMP_PATTERNS:
-                    m = re.search(pattern, all_text, re.IGNORECASE)
-                    if m:
-                        found_stamp = True
-                        stamp_source = "page text"
-                        start = max(0, m.start() - 5)
-                        end   = min(len(all_text), m.end() + 30)
-                        stamp_value = all_text[start:end].strip()
-                        break
-
-            if check_camera_ready:
+            # ── IEEE PDF eXpress validation stamp ─────────────────────────────
+            def _express():
+                if not check_camera_ready:
+                    report.pdf_express = CheckResult(passed=True, value="N/A (submission mode)")
+                    return
+                found_stamp, stamp_source, stamp_value = _find_stamp(pdf, file_bytes, validation_stamp)
                 report.pdf_express = CheckResult(
                     passed=found_stamp,
                     value=f"Validated ({stamp_source}): {stamp_value[:60]}" if found_stamp else "Not found",
                     issues=[] if found_stamp else [
-                        "No IEEE PDF eXpress validation stamp found in PDF metadata or text. "
+                        "No IEEE PDF eXpress validation stamp found in PDF metadata or page header/footer. "
                         "Upload to ieee-pdf-express.org, validate, then download the certified PDF."
-                    ]
+                    ],
                 )
-            else:
-                report.pdf_express = CheckResult(passed=True, value="N/A (submission mode)")
+            _run("pdf_express", _express)
 
-            # ── author names from author list ──────────────────────────────────
-            if check_camera_ready and author_names:
-                p1_text = (pdf.pages[0].extract_text() or "").lower()
-                found_authors = []
-                missing_authors = []
-                for name in author_names:
-                    name_lower = name.strip().lower()
-                    parts = name_lower.split()
-                    if not parts:
-                        continue
-                    # Check full name or last name + first initial
-                    if name_lower in p1_text:
-                        found_authors.append(name)
-                    elif len(parts) >= 2 and parts[-1] in p1_text and parts[0][0] in p1_text:
-                        found_authors.append(name)
+            # ── author info present (camera-ready) ────────────────────────────
+            def _authors():
+                if not check_camera_ready:
+                    report.author_info_present = CheckResult(passed=True, value="N/A (submission mode)")
+                    return
+                if first_page is None or not p1_has_text:
+                    report.author_info_present = CheckResult(
+                        passed=False, value="Could not verify (no text layer)",
+                        issues=["Page 1 has no extractable text — check author information manually"],
+                    )
+                    return
+                if author_names:
+                    p1_norm = _strip_accents(first_page_text)
+                    found_authors, missing_authors = [], []
+                    for name in author_names:
+                        if not str(name or "").strip():
+                            continue
+                        (found_authors if _author_on_page(str(name), p1_norm) else missing_authors).append(name)
+                    total = len(found_authors) + len(missing_authors)
+                    if not missing_authors:
+                        report.author_info_present = CheckResult(
+                            passed=True, value=f"All {len(found_authors)} author(s) found on page 1",
+                        )
+                    elif not found_authors:
+                        report.author_info_present = CheckResult(
+                            passed=False, value="No author names found",
+                            issues=["Author names not detected on page 1 — paper may still be anonymised or authors not yet added"],
+                        )
                     else:
-                        # Fuzzy: check if last name appears
-                        last = parts[-1]
-                        if len(last) >= 4 and last in p1_text:
-                            found_authors.append(name)
-                        else:
-                            missing_authors.append(name)
-
-                if not missing_authors:
-                    report.author_info_present = CheckResult(
-                        passed=True,
-                        value=f"All {len(found_authors)} author(s) found on page 1",
-                    )
-                elif len(missing_authors) == len(author_names):
-                    report.author_info_present = CheckResult(
-                        passed=False,
-                        value="No author names found",
-                        issues=["Author names not detected on page 1 — paper may still be anonymised or authors not yet added"]
-                    )
-                else:
-                    report.author_info_present = CheckResult(
-                        passed=False,
-                        value=f"{len(found_authors)}/{len(author_names)} author(s) found",
-                        issues=[f"Missing: {', '.join(missing_authors[:5])}"]
-                    )
-            elif check_camera_ready:
+                        report.author_info_present = CheckResult(
+                            passed=False, value=f"{len(found_authors)}/{total} author(s) found",
+                            issues=[f"Missing: {', '.join(missing_authors[:5])}"],
+                        )
+                    return
                 # No author list loaded — fall back to generic signal detection
                 signals = []
-                p1_text_raw = pdf.pages[0].extract_text() or ""
-                if _EMAIL_RE.search(p1_text_raw):
+                if _EMAIL_RE.search(first_page_text):
                     signals.append("email address found")
-                aff_match = _AFF_RE.findall(p1_text_raw[:2000])
+                aff_match = _AFF_RE.findall(first_page_text[:2000])
                 if aff_match:
                     signals.append(f"affiliation keyword: {aff_match[0]}")
-                for m in _NAME_RE.finditer(p1_text_raw[:2000]):
+                for m in _NAME_RE.finditer(first_page_text[:2000]):
                     if _is_likely_name(m.group(1), m.group(2)):
                         signals.append(f"name: {m.group(1)} {m.group(2)}")
                         break
                 if signals:
-                    report.author_info_present = CheckResult(
-                        passed=True,
-                        value=", ".join(signals),
-                    )
+                    report.author_info_present = CheckResult(passed=True, value=", ".join(signals))
                 else:
                     report.author_info_present = CheckResult(
-                        passed=False,
-                        value="No author signals detected",
-                        issues=["No author name, affiliation, or email detected on page 1. Load the author list in Data Import for precise checking."]
+                        passed=False, value="No author signals detected",
+                        issues=["No author name, affiliation, or email detected on page 1. Load the author list in Data Import for precise checking."],
                     )
-            else:
-                report.author_info_present = CheckResult(passed=True, value="N/A (submission mode)")
+            _run("author_info_present", _authors)
 
             # ── references section ────────────────────────────────────────────
-            ref_found, ref_count, ref_issues = _detect_references(pdf)
-            if ref_found:
-                report.references = CheckResult(
-                    passed=True,
-                    value=f"{ref_count} reference{'s' if ref_count != 1 else ''} found",
-                    issues=ref_issues,
-                )
-            else:
-                report.references = CheckResult(
-                    passed=False,
-                    value="Not found",
-                    issues=ref_issues,
-                )
-
-            # ── column layout ─────────────────────────────────────────────────
-            if expected_layout in ("single", "two-column"):
-                layouts = []
-                for page in pdf.pages[:3]:
-                    detected = _detect_column_layout(page)
-                    if detected != "unknown":
-                        layouts.append(detected)
-                if not layouts:
-                    report.column_layout = CheckResult(
+            def _refs():
+                ref_found, ref_count, ref_issues = _detect_references(pdf, page_texts)
+                if ref_found:
+                    report.references = CheckResult(
                         passed=True,
-                        value="Unknown",
-                        issues=["Could not determine layout — possibly scanned or image-only"]
+                        value=f"{ref_count} reference{'s' if ref_count != 1 else ''} found",
+                        issues=ref_issues,
                     )
                 else:
-                    two_col_votes = layouts.count("two-column")
-                    detected = "two-column" if two_col_votes > len(layouts) / 2 else "single"
-                    passed = detected == expected_layout
+                    report.references = CheckResult(passed=False, value="Not found", issues=ref_issues)
+            _run("references", _refs)
+
+            # ── citations vs reference list (numeric styles) ─────────────────
+            def _citations():
+                import references as refs_mod
+                text = refs_mod.extract_reading_text(pdf)
+                report.reading_text = text
+                a = refs_mod.analyse_citations(text)
+                report.reference_entries = a["entries"]
+                if a["status"] == "no_references":
+                    report.citations = CheckResult(passed=True, value="Not checked (no reference list)")
+                    return
+                if a["status"] != "ok":
+                    report.citations = CheckResult(passed=True, value="Not checked (author-year style)")
+                    return
+                issues = []
+                if a["missing"]:
+                    issues.append("Cited but not in reference list: " + ", ".join(f"[{n}]" for n in a["missing"]))
+                if a["uncited"]:
+                    issues.append("In reference list but never cited: " + ", ".join(f"[{n}]" for n in a["uncited"]))
+                n = len(a["entries"])
+                value = (f"All {n} references cited" if not issues else
+                         f"{len(a['uncited'])} uncited, {len(a['missing'])} missing of {n}")
+                report.citations = CheckResult(passed=not issues, value=value, issues=issues)
+            _run("citations", _citations)
+
+            # ── column layout ─────────────────────────────────────────────────
+            def _layout():
+                if expected_layout not in ("single", "two-column"):
+                    report.column_layout = CheckResult(passed=True, value="Not checked")
+                    return
+                layouts = [d for d in (_detect_column_layout(p) for p in pdf.pages[:3]) if d != "unknown"]
+                if not layouts:
                     report.column_layout = CheckResult(
-                        passed=passed,
-                        value=detected,
-                        issues=[] if passed else [
-                            f"Expected {expected_layout} layout but detected {detected}"
-                        ]
+                        passed=True, value="Unknown",
+                        issues=["Could not determine layout — possibly scanned or image-only"],
                     )
-            else:
+                    return
+                two_col_votes = layouts.count("two-column")
+                detected = "two-column" if two_col_votes > len(layouts) / 2 else "single"
+                passed = detected == expected_layout
                 report.column_layout = CheckResult(
-                    passed=True,
-                    value="Not checked",
+                    passed=passed, value=detected,
+                    issues=[] if passed else [f"Expected {expected_layout} layout but detected {detected}"],
                 )
+            _run("column_layout", _layout)
 
     except Exception as e:
         report.error = str(e)
@@ -828,10 +1179,12 @@ async def check_pdf_async(
     validation_stamp: str = "",
     use_llm_blind: bool = False,
     author_names: list[str] = None,
+    refs_excluded: bool = False,
 ) -> PDFCheckReport:
     """
     Async version of check_pdf. When use_llm_blind=True, calls the LLM
-    natively without threading hacks.
+    natively without threading hacks. Deterministic e-mail / ORCID / metadata
+    signals are always merged into the LLM verdict.
     """
     report = check_pdf(
         file_bytes=file_bytes,
@@ -844,26 +1197,32 @@ async def check_pdf_async(
         validation_stamp=validation_stamp,
         use_llm_blind=use_llm_blind,
         author_names=author_names,
+        refs_excluded=refs_excluded,
     )
 
-    # If LLM blind check is pending, run it now (we're in async context)
     if use_llm_blind and hasattr(report, '_llm_blind_pending'):
         page_text, fname = report._llm_blind_pending
         del report._llm_blind_pending
-        try:
-            llm_result = await check_blind_compliance_llm(page_text, fname)
-            report.blind_compliance = CheckResult(
-                passed=llm_result["passed"],
-                value=llm_result["explanation"] if llm_result["passed"] else f"{len(llm_result['signals'])} identity signal(s) detected",
-                issues=llm_result["signals"] if not llm_result["passed"] else []
-            )
-        except Exception as e:
-            # Show the error clearly rather than silently passing
-            report.blind_compliance = CheckResult(
-                passed=False,
-                value="AI check error — see details",
-                issues=[f"LLM blind check failed: {str(e)[:150]}. Check your API key in Settings."]
-            )
+        det_hits = [h for h in getattr(report, "_det_blind_hits", [])
+                    if not h.startswith("Possible author name")]
+        if not page_text.strip():
+            pass  # keep deterministic result (no text layer for the LLM either)
+        else:
+            try:
+                llm_result = await check_blind_compliance_llm(page_text, fname)
+                signals = list(dict.fromkeys(list(llm_result["signals"] or []) + det_hits))
+                passed = bool(llm_result["passed"]) and not det_hits
+                report.blind_compliance = CheckResult(
+                    passed=passed,
+                    value=llm_result["explanation"] if passed else f"{len(signals)} identity signal(s) detected",
+                    issues=[] if passed else signals,
+                )
+            except Exception as e:
+                report.blind_compliance = CheckResult(
+                    passed=False,
+                    value="AI check error — see details",
+                    issues=[f"LLM blind check failed: {str(e)[:150]}. Check your API key in Settings."] + det_hits,
+                )
 
     return report
 
@@ -875,6 +1234,8 @@ def report_to_dict(r: PDFCheckReport) -> dict:
     return {
         "filename": r.filename,
         "raw_pages": r.raw_pages,
+        "body_pages": r.body_pages,
+        "reference_pages": r.reference_pages,
         "page_count": cr(r.page_count),
         "font_embedding": cr(r.font_embedding),
         "blind_compliance": cr(r.blind_compliance),
@@ -884,5 +1245,7 @@ def report_to_dict(r: PDFCheckReport) -> dict:
         "text_extraction": cr(r.text_extraction),
         "column_layout": cr(r.column_layout),
         "references": cr(r.references),
+        "citations": cr(r.citations),
+        "reference_entries": r.reference_entries,
         "error": r.error,
     }

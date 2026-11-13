@@ -1,5 +1,7 @@
 // ── File parsing utilities ────────────────────────────────────────────────────
 
+import { loadJSZip, loadXLSX } from "./lazyLibs.js";
+
 export function readFileAsBase64(file) {
   return new Promise((res, rej) => {
     const r = new FileReader();
@@ -18,18 +20,12 @@ export function readFileAsText(file) {
   });
 }
 
-export async function loadScript(url) {
-  return new Promise((res, rej) => {
-    if (document.querySelector(`script[src="${url}"]`)) return res();
-    const s = document.createElement("script");
-    s.src = url; s.onload = res; s.onerror = rej;
-    document.head.appendChild(s);
-  });
-}
+// Third-party parsers are bundled (no runtime CDN loading) and code-split via
+// dynamic import() so they are only fetched when a ZIP/XLSX file is opened.
 
 export async function extractZipPDFs(zipFile) {
-  await loadScript("https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js");
-  const zip = await window.JSZip.loadAsync(zipFile);
+  const JSZip = await loadJSZip();
+  const zip = await JSZip.loadAsync(zipFile);
   const pdfs = [];
   for (const [name, entry] of Object.entries(zip.files)) {
     if (name.toLowerCase().endsWith(".pdf") && !entry.dir) {
@@ -40,39 +36,88 @@ export async function extractZipPDFs(zipFile) {
   return pdfs.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-export function parseCSV(text) {
-  const lines = text.trim().split(/\r?\n/);
-  if (!lines.length) return [];
-  const headers = lines[0].split(",").map(h => h.trim().replace(/^"|"$/g, ""));
-  return lines.slice(1).map(line => {
-    const cols = []; let cur = "", inQ = false;
-    for (const ch of line) {
-      if (ch === '"') { inQ = !inQ; }
-      else if (ch === "," && !inQ) { cols.push(cur.trim()); cur = ""; }
-      else cur += ch;
+// Detect the delimiter (, ; or TAB) from the header line, ignoring quoted text.
+export function detectDelimiter(text) {
+  const counts = { ",": 0, ";": 0, "\t": 0 };
+  let inQ = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '"') {
+      if (inQ && text[i + 1] === '"') { i++; continue; }
+      inQ = !inQ;
+    } else if (!inQ) {
+      if (ch === "\n" || ch === "\r") break;
+      if (ch in counts) counts[ch]++;
     }
-    cols.push(cur.trim());
+  }
+  let best = ",", n = 0;
+  for (const d of [",", ";", "\t"]) if (counts[d] > n) { best = d; n = counts[d]; }
+  return best;
+}
+
+// RFC-4180 state-machine tokenizer: returns an array of records (arrays of strings).
+// Handles quoted fields, escaped quotes (""), CR/LF/CRLF line endings and
+// newlines/delimiters inside quoted fields.
+export function parseCSVRecords(text, delimiter) {
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+  const delim = delimiter || detectDelimiter(text);
+  const records = [];
+  let row = [], field = "", inQ = false, fieldStarted = false;
+  const endField = () => { row.push(field); field = ""; fieldStarted = false; };
+  const endRow = () => {
+    endField();
+    if (!(row.length === 1 && row[0] === "")) records.push(row);   // skip blank lines
+    row = [];
+  };
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQ) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQ = false;
+      } else field += ch;
+      continue;
+    }
+    if (ch === '"' && !fieldStarted) { inQ = true; fieldStarted = true; }
+    else if (ch === delim) endField();
+    else if (ch === "\r") { if (text[i + 1] === "\n") i++; endRow(); }
+    else if (ch === "\n") endRow();
+    else { field += ch; fieldStarted = true; }
+  }
+  if (field !== "" || row.length) endRow();
+  return records;
+}
+
+export function parseCSV(text, delimiter) {
+  const records = parseCSVRecords(text, delimiter);
+  if (!records.length) return [];
+  const headers = records[0].map((h, i) => h.trim() || `column_${i + 1}`);
+  return records.slice(1).map(cols => {
     const row = {};
-    headers.forEach((h, i) => { row[h] = (cols[i] || "").replace(/^"|"$/g, ""); });
+    headers.forEach((h, i) => { row[h] = (cols[i] ?? "").trim(); });
     return row;
   });
 }
 
 export async function parseXLSX(file) {
-  await loadScript("https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js");
+  const XLSX = await loadXLSX();
   const buf = await file.arrayBuffer();
-  const wb = window.XLSX.read(buf, { type: "array" });
+  const wb = XLSX.read(buf, { type: "array" });
   const ws = wb.Sheets[wb.SheetNames[0]];
-  return window.XLSX.utils.sheet_to_json(ws, { defval: "" });
+  return XLSX.utils.sheet_to_json(ws, { defval: "" });
 }
 
-// Sanitise rows: replace newlines in all field values with spaces
+// Sanitise rows: replace newlines in all field values with spaces.
+// Keyword columns are the exception: EasyChair puts one keyword per line, so
+// those newlines become "; " to keep the keywords separate.
 export function sanitiseRows(rows) {
   return rows.map(row => {
     const clean = {};
     for (const [k, v] of Object.entries(row)) {
+      const isKw = /keyword/i.test(k);
       clean[k] = String(v == null ? "" : v)
-        .replace(/\r\n|\r|\n/g, " ")
+        .replace(/\r\n|\r|\n/g, isKw ? "; " : " ")
+        .replace(/(;\s*){2,}/g, "; ")
         .trim();
     }
     return clean;

@@ -43,12 +43,15 @@ export default defineConfig({
         transformObjectKeys: true,          // obfuscate object property names
         numbersToExpressions: true,         // replace numbers with expressions
       },
+      // lazyLibs.js holds the dynamic import() calls; obfuscating it would turn the
+      // module specifiers into runtime strings the bundler cannot resolve.
+      exclude: [/node_modules/, /lazyLibs\.js$/],
       // Only obfuscate the production build assets, not the dev server
       apply: 'build',
     }),
   ],
   server: {
-    host: '0.0.0.0',
+    host: '127.0.0.1',   // never expose the dev proxy (and API keys) to the LAN
     port: 5173,
     proxy: {
       '/api': { target: 'http://localhost:8000', changeOrigin: true },

@@ -16,6 +16,8 @@ from typing import Optional
 # The AI review quality module adds semantic assessment on top.
 
 QUALITY_TIERS = ["Very Good", "Good", "Average", "Poor", "Unacceptable"]
+# Assigned when the review text is not available (empty) — not a quality judgement.
+NO_TEXT_TIER = "No text available"
 
 
 @dataclass
@@ -108,17 +110,91 @@ def _safe_float(val) -> Optional[float]:
 
 
 def _percentile(values: list[float], v: float) -> float:
-    """Return what percentile v is in the list of values (0-100)."""
+    """Mid-rank percentile of v within values (0-100).
+
+    Ties count half, so identical values sit at the 50th percentile rather
+    than the 0th, and a single-element list yields 50.
+    """
     if not values:
         return 50.0
     below = sum(1 for x in values if x < v)
-    return round((below / len(values)) * 100, 1)
+    equal = sum(1 for x in values if x == v)
+    return round(((below + 0.5 * equal) / len(values)) * 100, 1)
 
 
 def _z_score(value: float, mean: float, stdev: float) -> Optional[float]:
-    if stdev == 0:
+    if stdev is None or stdev <= 0:
         return 0.0
     return (value - mean) / stdev
+
+
+# Minimum number of (non-synthetic) scored reviews a reviewer must have in a
+# track before their scores are z-normalised. Below this the stdev is not
+# meaningful and the raw score is used instead.
+MIN_REVIEWS_FOR_CALIBRATION = 3
+# Minimum number of scored papers in a track before percentile-based
+# recommendations are produced; below this the scale-relative raw fallback
+# is used with Low confidence.
+MIN_TRACK_PAPERS_FOR_PERCENTILE = 5
+
+_SCORE_KEYS = ("score", "Score", "overall", "Overall", "grade")
+_PAPER_KEYS = ("#", "id", "paper_id", "submission", "Paper", "paper")
+_TEXT_KEYS = ("review", "Review", "comments", "Comments", "text", "Text")
+
+
+def _rev_id(row: dict) -> str:
+    return (_get(row, "reviewer", "Reviewer", "reviewer_email", "email", "Email")
+            or _get(row, "reviewer_id", "ReviewerID"))
+
+
+def _score(row: dict) -> Optional[float]:
+    return _safe_float(_get(row, *_SCORE_KEYS))
+
+
+def _is_synthetic(row: dict) -> bool:
+    v = row.get("synthetic_reviewer")
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes")
+    return bool(v)
+
+
+def _infer_scale(scores: list[float]) -> tuple[float, float]:
+    """Infer the nominal score scale (lo, hi) from observed scores.
+
+    Negative scores -> symmetric scale (EasyChair -3..+3, -2..+2).
+    Otherwise lo is 0 or 1 and hi the smallest common scale top >= max.
+    """
+    if not scores:
+        return (1.0, 5.0)
+    lo_obs, hi_obs = min(scores), max(scores)
+    if lo_obs < 0:
+        b = float(math.ceil(max(abs(lo_obs), abs(hi_obs))))
+        return (-b, b)
+    lo = 0.0 if lo_obs < 1 else 1.0
+    for top in (3, 4, 5, 6, 7, 9, 10, 100):
+        if hi_obs <= top:
+            return (lo, float(top))
+    return (lo, float(math.ceil(hi_obs)))
+
+
+# "poster", "oral", "short paper" etc. are acceptance categories in EasyChair.
+_ACCEPT_DEC_RE = re.compile(r'^\s*(accept|accepted|poster|oral|short\s+paper|regular\s+paper|presentation)\b(?!\s*\?)', re.IGNORECASE)
+_REJECT_DEC_RE = re.compile(r'^\s*(reject|rejected|desk[\s-]*reject)', re.IGNORECASE)
+_BORDER_DEC_RE = re.compile(r'\?\s*$|accept\?|reject\?|borderline|undecided|maybe|tbd|unclear|pending|probabl', re.IGNORECASE)
+
+
+def _classify_decision(dec: str) -> str:
+    """Return 'accept' | 'reject' | 'borderline' | 'none'."""
+    dec = (dec or "").strip()
+    if not dec:
+        return "none"
+    if _BORDER_DEC_RE.search(dec):
+        return "borderline"
+    if _ACCEPT_DEC_RE.match(dec):
+        return "accept"
+    if _REJECT_DEC_RE.match(dec):
+        return "reject"
+    return "none"
 
 
 # ── Review quality flagging ───────────────────────────────────────────────────
@@ -142,6 +218,10 @@ def _assess_review_quality(
     text_len = len(review_text.strip()) if review_text else 0
 
     # ── Text length ────────────────────────────────────────────────────────
+    # No text at all means the export did not include it (e.g. EasyChair
+    # review_summary) — we cannot judge quality, so don't penalise.
+    if text_len == 0:
+        return NO_TEXT_TIER, ["No review text available in export — quality not assessed"]
     if text_len < 100:
         penalty += 4
         signals.append(f"Very short ({text_len} chars)")
@@ -229,6 +309,9 @@ def compute_stats(
     reject_threshold_pct: float = 35.0,   # bottom X% → reject
 ) -> ReviewStatsReport:
 
+    submission_rows = submission_rows or []
+    assignment_rows = assignment_rows or []
+
     # ── Index submissions ──────────────────────────────────────────────────
     sub_by_id: dict[str, dict] = {}
     for row in submission_rows:
@@ -237,128 +320,183 @@ def compute_stats(
             sub_by_id[pid] = row
 
     # ── Group reviews by paper and reviewer ───────────────────────────────
+    # Rows with neither a reviewer nor a score are paper placeholders (e.g. a
+    # review_summary line for a paper with no reviews yet): they register the
+    # paper but are not counted as reviews.
     reviews_by_paper: dict[str, list[dict]] = {}
     reviews_by_reviewer: dict[str, list[dict]] = {}
+    review_meta: dict[str, dict] = {}       # pid → first review row (title/track fallback)
+    real_reviews: list[dict] = []
     all_scores: list[float] = []
 
     for row in review_rows:
-        pid = _get(row, "#", "id", "paper_id", "submission", "Paper", "paper")
-        rev = (_get(row, "reviewer", "Reviewer", "reviewer_email", "email", "Email")
-               or _get(row, "reviewer_id", "ReviewerID"))
+        pid = _get(row, *_PAPER_KEYS)
+        rev = _rev_id(row)
+        s = _score(row)
+        if pid and pid not in review_meta:
+            review_meta[pid] = row
+        if not rev and s is None and not _get(row, *_TEXT_KEYS):
+            continue  # placeholder, not a review
+        real_reviews.append(row)
         if pid:
             reviews_by_paper.setdefault(pid, []).append(row)
         if rev:
             reviews_by_reviewer.setdefault(rev, []).append(row)
-        s = _safe_float(_get(row, "score", "Score", "overall", "Overall", "grade"))
         if s is not None:
             all_scores.append(s)
 
+    scale_lo, scale_hi = _infer_scale(all_scores)
+    scale_mid = (scale_lo + scale_hi) / 2.0
+    scale_span = (scale_hi - scale_lo) or 1.0
+
+    def _track_of(pid: str) -> str:
+        return (_get(sub_by_id.get(pid, {}), "track", "Track")
+                or _get(review_meta.get(pid, {}), "track", "Track")
+                or "Unassigned")
+
+    def _title_of(pid: str) -> str:
+        return (_get(sub_by_id.get(pid, {}), "title", "Title")
+                or _get(review_meta.get(pid, {}), "title", "Title"))
+
+    # Universe of papers: every submission plus anything that appears in reviews.
+    all_pids: list[str] = list(sub_by_id.keys())
+    for pid in list(review_meta.keys()) + list(reviews_by_paper.keys()):
+        if pid not in sub_by_id and pid not in all_pids:
+            all_pids.append(pid)
+
     # ── Per-track grouping ─────────────────────────────────────────────────
     papers_by_track: dict[str, list[str]] = {}
-    for pid, meta in sub_by_id.items():
-        track = _get(meta, "track", "Track") or "Unassigned"
-        papers_by_track.setdefault(track, []).append(pid)
+    for pid in all_pids:
+        papers_by_track.setdefault(_track_of(pid), []).append(pid)
 
     # ── Reviewer calibration: mean/stdev per reviewer per track ───────────
-    # Structure: { track → { reviewer_id → [scores] } }
+    # Synthetic reviewers (per-paper placeholder IDs) are never calibrated.
     reviewer_scores_by_track: dict[str, dict[str, list[float]]] = {}
-
     for pid, rvs in reviews_by_paper.items():
-        meta = sub_by_id.get(pid, {})
-        track = _get(meta, "track", "Track") or "Unassigned"
+        track = _track_of(pid)
         for rv in rvs:
-            rev_id = (_get(rv, "reviewer", "Reviewer", "reviewer_email", "email", "Email")
-                      or _get(rv, "reviewer_id", "ReviewerID"))
-            s = _safe_float(_get(rv, "score", "Score", "overall", "Overall", "grade"))
-            if rev_id and s is not None:
+            rev_id = _rev_id(rv)
+            s = _score(rv)
+            if rev_id and s is not None and not _is_synthetic(rv):
                 reviewer_scores_by_track.setdefault(track, {}).setdefault(rev_id, []).append(s)
 
-    # Compute reviewer mean/stdev per track
+    # Only reviewers with enough reviews get calibration stats.
     reviewer_stats_by_track: dict[str, dict[str, dict]] = {}
     for track, rev_map in reviewer_scores_by_track.items():
         reviewer_stats_by_track[track] = {}
         for rev_id, scores in rev_map.items():
+            if len(scores) < MIN_REVIEWS_FOR_CALIBRATION:
+                continue
             m = statistics.mean(scores)
-            sd = statistics.stdev(scores) if len(scores) >= 2 else 1.0
-            reviewer_stats_by_track[track][rev_id] = {"mean": m, "stdev": max(sd, 0.01)}
+            sd = statistics.stdev(scores)
+            reviewer_stats_by_track[track][rev_id] = {
+                "mean": m, "stdev": sd, "n": len(scores),
+            }
 
-    # ── Compute calibrated scores per paper ───────────────────────────────
-    # For each review, compute z-score relative to reviewer's track behaviour.
-    # Calibrated paper score = mean of reviewer z-scores.
+    # Track-level raw distribution (used to put uncalibrated raw scores on
+    # the same z-like footing as calibrated ones).
+    track_raw: dict[str, tuple[float, float]] = {}
+    for track, pids in papers_by_track.items():
+        ts = [s for pid in pids for s in (_score(r) for r in reviews_by_paper.get(pid, [])) if s is not None]
+        if ts:
+            track_raw[track] = (statistics.mean(ts), statistics.stdev(ts) if len(ts) >= 2 else 0.0)
+
+    # ── Per-paper ranking score ───────────────────────────────────────────
+    # Each review contributes the reviewer's z-score when the reviewer is
+    # calibratable (≥ MIN_REVIEWS_FOR_CALIBRATION real reviews in the track,
+    # non-zero stdev), otherwise its raw score standardised against the
+    # track's raw distribution. calibrated_mean is reported only when at
+    # least one review was reviewer-calibrated.
+    paper_rank_score: dict[str, float] = {}
     paper_calibrated: dict[str, float] = {}
+    paper_cal_count: dict[str, int] = {}
     paper_raw_scores: dict[str, list[float]] = {}
 
     for pid, rvs in reviews_by_paper.items():
-        meta = sub_by_id.get(pid, {})
-        track = _get(meta, "track", "Track") or "Unassigned"
+        track = _track_of(pid)
         rev_stats = reviewer_stats_by_track.get(track, {})
+        t_mean, t_sd = track_raw.get(track, (0.0, 0.0))
 
-        z_scores = []
-        raw_scores = []
+        vals: list[float] = []
+        raw_scores: list[float] = []
+        n_cal = 0
         for rv in rvs:
-            rev_id = (_get(rv, "reviewer", "Reviewer", "reviewer_email", "email", "Email")
-                      or _get(rv, "reviewer_id", "ReviewerID"))
-            s = _safe_float(_get(rv, "score", "Score", "overall", "Overall", "grade"))
-            if s is not None:
-                raw_scores.append(s)
-                rs = rev_stats.get(rev_id)
-                if rs:
-                    z = _z_score(s, rs["mean"], rs["stdev"])
-                    if z is not None:
-                        z_scores.append(z)
+            s = _score(rv)
+            if s is None:
+                continue
+            raw_scores.append(s)
+            rs = None if _is_synthetic(rv) else rev_stats.get(_rev_id(rv))
+            if rs and rs["stdev"] > 0:
+                vals.append(_z_score(s, rs["mean"], rs["stdev"]))
+                n_cal += 1
+            else:
+                vals.append(_z_score(s, t_mean, t_sd))
 
         paper_raw_scores[pid] = raw_scores
-        if z_scores:
-            paper_calibrated[pid] = statistics.mean(z_scores)
+        paper_cal_count[pid] = n_cal
+        if vals:
+            paper_rank_score[pid] = statistics.mean(vals)
+            if n_cal > 0:
+                paper_calibrated[pid] = paper_rank_score[pid]
 
-    # ── Per-track calibrated score distribution ───────────────────────────
-    track_calibrated_scores: dict[str, list[float]] = {}
-    for pid, cal_score in paper_calibrated.items():
-        meta = sub_by_id.get(pid, {})
-        track = _get(meta, "track", "Track") or "Unassigned"
-        track_calibrated_scores.setdefault(track, []).append(cal_score)
+    # ── Per-track ranking-score distribution ──────────────────────────────
+    track_rank_scores: dict[str, list[float]] = {}
+    for pid, sc in paper_rank_score.items():
+        track_rank_scores.setdefault(_track_of(pid), []).append(sc)
+
+    # Scale-relative raw thresholds (EasyChair -3..+3 → ±0.75; 1..5 → 3.5/2.5)
+    raw_accept_thr = scale_mid + scale_span / 8.0
+    raw_reject_thr = scale_mid - scale_span / 8.0
 
     # ── Recommendations per paper ─────────────────────────────────────────
     paper_decisions: list[PaperDecision] = []
     missing_reviews: list[dict] = []
     high_variance_papers: list[dict] = []
 
-    for pid, rvs in reviews_by_paper.items():
-        meta = sub_by_id.get(pid, {})
-        title = _get(meta, "title", "Title")
-        track = _get(meta, "track", "Track") or "Unassigned"
+    for pid in all_pids:
+        rvs = reviews_by_paper.get(pid, [])
+        title = _title_of(pid)
+        track = _track_of(pid)
         raw_scores = paper_raw_scores.get(pid, [])
 
         raw_mean = statistics.mean(raw_scores) if raw_scores else None
         raw_stdev = statistics.stdev(raw_scores) if len(raw_scores) >= 2 else None
         cal_score = paper_calibrated.get(pid)
-        track_scores = track_calibrated_scores.get(track, [])
-        percentile = _percentile(track_scores, cal_score) if cal_score is not None and track_scores else None
+        rank_score = paper_rank_score.get(pid)
+        track_scores = track_rank_scores.get(track, [])
+        track_has_variance = len(set(round(x, 9) for x in track_scores)) > 1
+        percentile_usable = (
+            rank_score is not None
+            and len(track_scores) >= MIN_TRACK_PAPERS_FOR_PERCENTILE
+            and track_has_variance
+        )
+        percentile = (_percentile(track_scores, rank_score)
+                      if rank_score is not None and track_scores else None)
 
         # Confidence-weighted mean
         conf_weighted = None
         weighted_sum = 0.0
         weight_total = 0.0
         for rv in rvs:
-            s = _safe_float(_get(rv, "score", "Score", "overall", "Overall", "grade"))
+            s = _score(rv)
             c = _safe_float(_get(rv, "confidence", "Confidence"))
-            if s is not None and c is not None:
+            if s is not None and c is not None and c > 0:
                 weighted_sum += s * c
                 weight_total += c
         if weight_total > 0:
             conf_weighted = round(weighted_sum / weight_total, 2)
 
-        # Recommendation based on calibrated percentile within track
         requires_discussion = False
         discussion_reason = ""
         confidence_level = "Medium"
+        fully_calibrated = bool(raw_scores) and paper_cal_count.get(pid, 0) == len(raw_scores)
 
-        if percentile is not None:
+        if percentile_usable and percentile is not None:
             if percentile >= accept_threshold_pct:
                 if raw_stdev is not None and raw_stdev >= high_variance_threshold:
                     recommendation = "Borderline"
                     requires_discussion = True
-                    discussion_reason = f"Top {100-accept_threshold_pct:.0f}% calibrated score but high variance (σ={raw_stdev:.1f})"
+                    discussion_reason = f"Top {100-accept_threshold_pct:.0f}% score in track but high variance (σ={raw_stdev:.1f})"
                     confidence_level = "Low"
                 else:
                     recommendation = "Strong Accept" if percentile >= 85 else "Accept"
@@ -369,12 +507,26 @@ def compute_stats(
             else:
                 recommendation = "Borderline"
                 requires_discussion = True
-                discussion_reason = f"Calibrated score at {percentile:.0f}th percentile in track"
+                discussion_reason = f"Score at {percentile:.0f}th percentile in track"
+                confidence_level = "Low"
+            # Without proper reviewer calibration, don't claim high confidence
+            if confidence_level == "High" and not fully_calibrated:
+                confidence_level = "Medium"
+            if len(raw_scores) < 2 and confidence_level != "Low":
                 confidence_level = "Low"
         elif raw_mean is not None:
-            # Fallback: use raw scores if calibration unavailable
-            recommendation = "Accept" if raw_mean >= 3.5 else ("Reject" if raw_mean < 2.5 else "Borderline")
+            # Fallback: scale-relative thresholds on raw mean (too few papers
+            # in the track, or no score variance to rank on).
+            if raw_mean >= raw_accept_thr:
+                recommendation = "Accept"
+            elif raw_mean < raw_reject_thr:
+                recommendation = "Reject"
+            else:
+                recommendation = "Borderline"
             requires_discussion = recommendation == "Borderline"
+            if requires_discussion:
+                discussion_reason = (f"Raw mean {raw_mean:.2f} near scale midpoint "
+                                     f"({scale_lo:g}..{scale_hi:g})")
             confidence_level = "Low"
         else:
             recommendation = "Insufficient data"
@@ -389,12 +541,13 @@ def compute_stats(
                 "review_count": len(rvs),
             })
 
-        # Missing reviews
+        # Missing reviews (includes papers with zero reviews)
         if len(rvs) < min_reviews_per_paper:
             missing_reviews.append({
                 "id": pid, "title": title, "track": track,
                 "review_count": len(rvs),
                 "needed": min_reviews_per_paper - len(rvs),
+                "no_reviews": len(rvs) == 0,
             })
 
         paper_decisions.append(PaperDecision(
@@ -411,25 +564,23 @@ def compute_stats(
             discussion_reason=discussion_reason,
         ))
 
+    # Zero-review papers first, then fewest reviews.
+    missing_reviews.sort(key=lambda m: (m["review_count"], str(m["id"])))
+
     # ── Review quality flagging ───────────────────────────────────────────
     quality_flags: list[ReviewQualityFlag] = []
 
     for idx, rv in enumerate(review_rows):
-        pid = _get(rv, "#", "id", "paper_id", "submission", "Paper", "paper")
-        rev_id = (_get(rv, "reviewer", "Reviewer", "reviewer_email", "email", "Email")
-                  or _get(rv, "reviewer_id", "ReviewerID"))
-        score = _safe_float(_get(rv, "score", "Score", "overall", "Overall", "grade"))
+        pid = _get(rv, *_PAPER_KEYS)
+        rev_id = _rev_id(rv)
+        score = _score(rv)
+        if not rev_id and score is None and not _get(rv, *_TEXT_KEYS):
+            continue  # placeholder row, not a review
         confidence = _safe_float(_get(rv, "confidence", "Confidence"))
-        text = _get(rv, "review", "Review", "comments", "Comments", "text", "Text")
+        text = _get(rv, *_TEXT_KEYS)
 
-        meta = sub_by_id.get(pid, {})
-        track = _get(meta, "track", "Track") or "Unassigned"
-        all_paper_scores = [
-            s for s in [
-                _safe_float(_get(r, "score", "Score", "overall", "Overall", "grade"))
-                for r in reviews_by_paper.get(pid, [])
-            ] if s is not None
-        ]
+        track = _track_of(pid)
+        all_paper_scores = [s for s in (_score(r) for r in reviews_by_paper.get(pid, [])) if s is not None]
 
         rev_stats_t = reviewer_stats_by_track.get(track, {}).get(rev_id, {})
         rev_mean = rev_stats_t.get("mean")
@@ -451,40 +602,66 @@ def compute_stats(
             confidence=confidence,
         ))
 
+    # ── Assignments (optional): who was assigned what ─────────────────────
+    assigned_by_reviewer: dict[str, set] = {}
+    for row in assignment_rows:
+        rev = (_rev_id(row) or _get(row, "member", "Member", "PC member", "pc_member", "name", "Name"))
+        pid = _get(row, *_PAPER_KEYS)
+        if rev:
+            assigned_by_reviewer.setdefault(rev, set())
+            if pid:
+                assigned_by_reviewer[rev].add(pid)
+
     # ── Per-reviewer summary ──────────────────────────────────────────────
     reviewer_summary = []
     overloaded = []
     underloaded = []
 
-    for rev, rvs in reviews_by_reviewer.items():
-        scores = [s for s in [
-            _safe_float(_get(r, "score", "Score", "overall", "Overall", "grade"))
-            for r in rvs
-        ] if s is not None]
-        mean_score = statistics.mean(scores) if scores else None
-        flags_for_rev = [f for f in quality_flags if f.reviewer_id == rev]
-        tier_counts = {t: sum(1 for f in flags_for_rev if f.tier == t) for t in QUALITY_TIERS}
+    flags_by_rev: dict[str, list[ReviewQualityFlag]] = {}
+    for f in quality_flags:
+        flags_by_rev.setdefault(f.reviewer_id, []).append(f)
 
-        reviewer_summary.append({
+    all_reviewers = list(reviews_by_reviewer.keys()) + [
+        r for r in assigned_by_reviewer if r not in reviews_by_reviewer
+    ]
+    for rev in all_reviewers:
+        rvs = reviews_by_reviewer.get(rev, [])
+        scores = [s for s in (_score(r) for r in rvs) if s is not None]
+        mean_score = statistics.mean(scores) if scores else None
+        flags_for_rev = flags_by_rev.get(rev, [])
+        tier_counts = {t: sum(1 for f in flags_for_rev if f.tier == t) for t in QUALITY_TIERS}
+        no_text = sum(1 for f in flags_for_rev if f.tier == NO_TEXT_TIER)
+        if no_text:
+            tier_counts[NO_TEXT_TIER] = no_text
+        assigned = len(assigned_by_reviewer.get(rev, ()))
+
+        entry = {
             "id": rev,
             "review_count": len(rvs),
             "mean_score_given": round(mean_score, 2) if mean_score is not None else None,
             "quality_tier_counts": tier_counts,
-        })
+            "synthetic": bool(rvs) and all(_is_synthetic(r) for r in rvs),
+        }
+        if assigned_by_reviewer:
+            entry["assigned_count"] = assigned
+        reviewer_summary.append(entry)
 
-        if len(rvs) > max_load_per_reviewer:
-            overloaded.append({"id": rev, "count": len(rvs)})
-        if len(rvs) < min_load_per_reviewer:
-            underloaded.append({"id": rev, "count": len(rvs)})
+        # Synthetic per-paper reviewer IDs carry no load information.
+        if rvs and all(_is_synthetic(r) for r in rvs):
+            continue
+        load = max(len(rvs), assigned)
+        if load > max_load_per_reviewer:
+            overloaded.append({"id": rev, "count": load})
+        # Load counts assigned papers too, so reviewers who appear only in the
+        # assignments file (0 completed reviews) are caught.
+        if load < min_load_per_reviewer or (assigned and len(rvs) == 0):
+            underloaded.append({"id": rev, "count": len(rvs), "assigned": assigned})
 
     # ── Per-track stats ───────────────────────────────────────────────────
     track_stats_list = []
     for track, pids in papers_by_track.items():
         track_reviews = [rv for pid in pids for rv in reviews_by_paper.get(pid, [])]
-        track_scores = [s for s in [
-            _safe_float(_get(r, "score", "Score", "overall", "Overall", "grade"))
-            for r in track_reviews
-        ] if s is not None]
+        track_scores = [s for s in (_score(r) for r in track_reviews) if s is not None]
         rev_stats = reviewer_stats_by_track.get(track, {})
         expected = len(pids) * min_reviews_per_paper
         completion = round(len(track_reviews) / expected * 100, 1) if expected > 0 else 0.0
@@ -510,13 +687,8 @@ def compute_stats(
     accepted = rejected = borderline = no_decision = 0
     decisions_by_track: dict[str, dict] = {}
 
-    _ACCEPT_RE = re.compile(r'^\s*accept\s*$', re.IGNORECASE)
-    _REJECT_RE = re.compile(r'^\s*reject\s*$', re.IGNORECASE)
-    _BORDER_RE = re.compile(r'accept\?|borderline|undecided|maybe|tbd|unclear', re.IGNORECASE)
-
     for row in submission_rows:
-        dec_raw = _get(row, "decision", "Decision", "DECISION", "status", "Status") or ""
-        dec = dec_raw.strip()
+        dec = _get(row, "decision", "Decision", "DECISION", "status", "Status") or ""
         track = _get(row, "track", "Track") or "Unassigned"
 
         if track not in decisions_by_track:
@@ -528,13 +700,14 @@ def compute_stats(
             }
         decisions_by_track[track]["total"] += 1
 
-        if _ACCEPT_RE.match(dec):
+        kind = _classify_decision(dec)
+        if kind == "accept":
             accepted += 1
             decisions_by_track[track]["accepted"] += 1
-        elif _REJECT_RE.match(dec):
+        elif kind == "reject":
             rejected += 1
             decisions_by_track[track]["rejected"] += 1
-        elif _BORDER_RE.search(dec):
+        elif kind == "borderline":
             borderline += 1
             decisions_by_track[track]["borderline"] += 1
         else:
@@ -555,11 +728,19 @@ def compute_stats(
     )
 
     # ── Completion rate ───────────────────────────────────────────────────
-    expected_total = len(sub_by_id) * min_reviews_per_paper if sub_by_id else len(reviews_by_paper) * min_reviews_per_paper
-    completion = round(len(review_rows) / expected_total * 100, 1) if expected_total > 0 else 0.0
+    expected_total = len(all_pids) * min_reviews_per_paper
+    completion = round(len(real_reviews) / expected_total * 100, 1) if expected_total > 0 else 0.0
 
-    return ReviewStatsReport(
-        total_reviews=len(review_rows),
+    def _sort_key(p: PaperDecision) -> float:
+        if p.calibrated_mean is not None:
+            return p.calibrated_mean
+        rs = paper_rank_score.get(p.paper_id)
+        if rs is not None:
+            return rs
+        return float("-inf")
+
+    report = ReviewStatsReport(
+        total_reviews=len(real_reviews),
         total_papers=len(reviews_by_paper),
         total_reviewers=len(reviews_by_reviewer),
         completion_rate=completion,
@@ -569,7 +750,7 @@ def compute_stats(
         score_max=max(all_scores) if all_scores else None,
         score_distribution=score_dist,
         tracks=track_stats_list,
-        papers=sorted(paper_decisions, key=lambda p: p.calibrated_mean or p.raw_mean or 0, reverse=True),
+        papers=sorted(paper_decisions, key=_sort_key, reverse=True),
         reviewers=reviewer_summary,
         missing_reviews=missing_reviews,
         overloaded_reviewers=overloaded,
@@ -584,6 +765,11 @@ def compute_stats(
         acceptance_rate=acceptance_rate,
         decisions_by_track=sorted(decisions_by_track.values(), key=lambda x: x["track"]),
     )
+    # Extra (non-dataclass) info exposed by report_to_dict
+    report.score_scale = (scale_lo, scale_hi)
+    report.papers_without_reviews = sum(1 for m in missing_reviews if m["review_count"] == 0)
+    report.calibrated_reviewers = sum(len(v) for v in reviewer_stats_by_track.values())
+    return report
 
 
 def report_to_dict(r: ReviewStatsReport) -> dict:
@@ -643,4 +829,7 @@ def report_to_dict(r: ReviewStatsReport) -> dict:
         "no_decision": r.no_decision,
         "acceptance_rate": r.acceptance_rate,
         "decisions_by_track": r.decisions_by_track,
+        "score_scale": list(getattr(r, "score_scale", (None, None))),
+        "papers_without_reviews": getattr(r, "papers_without_reviews", 0),
+        "calibrated_reviewers": getattr(r, "calibrated_reviewers", 0),
     }

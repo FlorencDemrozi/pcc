@@ -1,8 +1,9 @@
 import { useState } from "react";
 import { C, IS, LS } from "../utils/theme.js";
-import { SectionTitle, StatCard, GhostButton, PrimaryButton, EmptyState } from "../components/ui.jsx";
-import { getField } from "../utils/helpers.js";
-import { rowsToCSV } from "../utils/helpers.js";
+import { SectionTitle, GhostButton, PrimaryButton, EmptyState, InfoBanner } from "../components/ui.jsx";
+import { rowsToCSV, rowId } from "../utils/helpers.js";
+import { errorFromResponse, isAbortError } from "../utils/api.js";
+import { useRunGuard } from "../utils/useRunGuard.js";
 
 const DEC_COLOR = {
   "Strong Accept": C.green, "Accept": "#0D9488", "Weak Accept": "#4ade80",
@@ -16,13 +17,15 @@ export function DecisionsModule({ conf, metaRows, reviewRows, activeTrack = "All
   const [decisions,    setDecisions]    = useState([]);
   const [filter,       setFilter]       = useState("All");
   const [expanded,     setExpanded]     = useState(null);
+  const [error,        setError]        = useState("");
+  const guard = useRunGuard();
 
   const ready = reviewRows.length > 0;
 
   const filteredMeta = activeTrack === "All" ? metaRows
     : metaRows.filter(r => String(r.Track || r.track || "").trim() === activeTrack);
   const trackPids = activeTrack === "All" ? null
-    : new Set(filteredMeta.map(r => String(r["#"] || r.paper_id || r.id || "").trim()));
+    : new Set(filteredMeta.map(rowId));
   const filteredReviews = activeTrack === "All" ? reviewRows
     : reviewRows.filter(r => {
         const pid = String(r["#"] || r.paper_id || r.submission || r["paper id"] || "").trim();
@@ -31,33 +34,43 @@ export function DecisionsModule({ conf, metaRows, reviewRows, activeTrack = "All
 
   const run = async () => {
     if (!ready) return;
-    setRunning(true); setDecisions([]);
+    const signal = guard.start();
+    setRunning(true); setDecisions([]); setError("");
     try {
       const fd = new FormData();
       fd.append("reviews_file",    new Blob([rowsToCSV(filteredReviews)],  { type: "text/csv" }), "reviews.csv");
       if (filteredMeta.length > 0)
         fd.append("submissions_file", new Blob([rowsToCSV(filteredMeta)], { type: "text/csv" }), "submissions.csv");
       fd.append("custom_prompt", customPrompt);
-      const r = await fetch("/api/decisions/run", { method: "POST", body: fd });
-      if (!r.ok) { const e = await r.json(); throw new Error(e.detail || "Error"); }
+      const r = await fetch("/api/decisions/run", { method: "POST", body: fd, signal });
+      if (!r.ok) throw await errorFromResponse(r);
       const d = await r.json();
-      setDecisions(d.decisions || []);
-    } catch (e) { alert("Error: " + e.message); }
+      if (!guard.isCancelled()) setDecisions(d.decisions || []);
+    } catch (e) {
+      if (isAbortError(e) || guard.isCancelled()) setError("Stopped. Results from this run were discarded.");
+      else setError(`Decision run failed: ${e.message}`);
+    }
     setRunning(false);
   };
 
   const exportFile = async fmt => {
-    const r = await fetch(`/api/decisions/export/${fmt}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ decisions }),
-    });
-    if (!r.ok) return;
-    const blob = await r.blob();
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `decisions.${fmt}`;
-    a.click();
+    setError("");
+    try {
+      const r = await fetch(`/api/decisions/export/${fmt}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decisions }),
+      });
+      if (!r.ok) throw await errorFromResponse(r);
+      const blob = await r.blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `decisions.${fmt}`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    } catch (e) {
+      setError(`Export to ${fmt.toUpperCase()} failed: ${e.message}`);
+    }
   };
 
   const decCounts       = decisions.reduce((a, d) => { a[d.decision] = (a[d.decision] || 0) + 1; return a; }, {});
@@ -87,9 +100,14 @@ export function DecisionsModule({ conf, metaRows, reviewRows, activeTrack = "All
             placeholder={"Leave empty for standard criteria, or describe your requirements:\ne.g. Accept only papers where all reviewers gave a positive score."}
             value={customPrompt} onChange={e => setCustomPrompt(e.target.value)} />
         </div>
-        <PrimaryButton onClick={run} disabled={running}>{running ? "Processing…" : "Run decisions →"}</PrimaryButton>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <PrimaryButton onClick={run} disabled={running}>{running ? "Processing…" : "Run decisions →"}</PrimaryButton>
+          {running && <GhostButton small onClick={guard.stop}>■ Stop</GhostButton>}
+        </div>
         {running && <div style={{ fontSize: 12, color: C.muted, marginTop: 8 }}>Processing papers — this may take a moment…</div>}
       </div>
+
+      {error && <InfoBanner type="error">{error}</InfoBanner>}
 
       {decisions.length > 0 && (
         <>

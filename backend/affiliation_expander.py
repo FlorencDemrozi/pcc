@@ -2,7 +2,7 @@
 affiliation_expander.py — automatic synonym expansion for institution affiliations.
 
 Two-stage pipeline:
-  1. ROR (Research Organization Registry) — free, no key, 100k+ institutions
+  1. ROR (Research Organization Registry) v2 API — free, no key, 100k+ institutions
   2. LLM fallback — for abbreviations, misspellings, informal names ROR misses
 
 Call expand_affiliations(affiliation_strings) once before the COI check.
@@ -16,91 +16,139 @@ import httpx
 
 
 # ── ROR API ───────────────────────────────────────────────────────────────────
+# ROR API/schema v1 was sunset in December 2025 (v1 requests return 410), so
+# the v2 endpoint and v2 record shape (organization.names[]) are used.
 
-ROR_API = "https://api.ror.org/organizations"
-ROR_TIMEOUT = 8.0      # seconds per request
-ROR_CONCURRENCY = 5    # max parallel requests
+ROR_API = "https://api.ror.org/v2/organizations"
+ROR_TIMEOUT = 8.0          # seconds per request
+ROR_CONCURRENCY = 5        # max parallel requests
+ROR_OVERALL_CAP = 30.0     # seconds for the whole ROR stage (partial results kept)
 
 
 def _clean_affiliation(aff: str) -> str:
-    """Normalise an affiliation string for lookup."""
-    # Remove department/lab prefixes that confuse ROR
-    aff = re.sub(
-        r'(?i)^(dept\.?|department of|lab(?:oratory)? of|school of|'
-        r'faculty of|institute of|center for|centre for)\s+\S+\s*,?\s*',
-        '', aff
-    ).strip()
-    # Remove trailing country/city if comma-separated
-    parts = [p.strip() for p in aff.split(',')]
-    # Keep longest meaningful part
-    return max(parts, key=len) if parts else aff
+    """Reduce an affiliation to its institution-level segment for lookup
+    (drops department/lab prefixes and trailing city/country segments)."""
+    try:
+        from coi_checker import _institution_parts, _norm_aff
+        segs = [s.strip() for s in re.split(r'[,;\n|]+', aff or "") if s.strip()]
+        inst_norm, qual_norm = _institution_parts(aff)
+        # Return the original-cased institution segment (+ campus qualifier,
+        # e.g. "University of California, Davis")
+        for i, s in enumerate(segs):
+            if _norm_aff(s) == inst_norm:
+                if qual_norm and i + 1 < len(segs) and _norm_aff(segs[i + 1]) == qual_norm:
+                    return f"{s}, {segs[i + 1]}"
+                return s
+        if inst_norm:
+            return inst_norm
+    except Exception:
+        pass
+    parts = [p.strip() for p in (aff or "").split(',') if p.strip()]
+    return max(parts, key=len) if parts else (aff or "").strip()
+
+
+def _parse_ror_v2_item(item: dict) -> Optional[dict]:
+    org = item.get("organization") or {}
+    names = org.get("names") or []
+    canonical = ""
+    aliases, acronyms, labels = [], [], []
+    for n in names:
+        if not isinstance(n, dict):
+            continue
+        val = (n.get("value") or "").strip()
+        if not val:
+            continue
+        types = n.get("types") or []
+        if "ror_display" in types and not canonical:
+            canonical = val
+        if "acronym" in types:
+            acronyms.append(val)
+        elif "alias" in types:
+            aliases.append(val)
+        elif "label" in types:
+            labels.append(val)
+    if not canonical:
+        canonical = (labels[0] if labels else (org.get("name") or "")).strip()
+    if not canonical:
+        return None
+    return {
+        "canonical": canonical,
+        "aliases":   aliases,
+        "acronyms":  acronyms,
+        "labels":    labels,
+        "score":     item.get("score", 0),
+        "id":        org.get("id", ""),
+    }
 
 
 async def _ror_lookup(client: httpx.AsyncClient, affiliation: str) -> Optional[dict]:
     """
-    Query ROR for a single affiliation string.
-    Returns the best match or None.
+    Query ROR (v2 affiliation matching) for a single affiliation string.
+    Returns the match ROR marks as `chosen` (ROR's recommended signal for
+    automatic selection), or None. Never raises.
     """
     query = _clean_affiliation(affiliation)
     if len(query) < 4:
         return None
     try:
-        r = await client.get(
-            ROR_API,
-            params={"affiliation": query},
-            timeout=ROR_TIMEOUT,
-        )
+        r = await client.get(ROR_API, params={"affiliation": query}, timeout=ROR_TIMEOUT)
         if r.status_code != 200:
             return None
-        data = r.json()
-        items = data.get("items", [])
-        if not items:
-            return None
-        # Take the top result if confidence is high enough
-        best = items[0]
-        score = best.get("score", 0)
-        chosen = best.get("chosen", False)
-        if score >= 0.8 or chosen:
-            org = best.get("organization", {})
-            return {
-                "canonical": org.get("name", ""),
-                "aliases":   org.get("aliases", []),
-                "acronyms":  org.get("acronyms", []),
-                "labels":    [l.get("label", "") for l in org.get("labels", [])],
-                "score":     score,
-            }
+        items = (r.json() or {}).get("items", []) or []
+        for it in items:
+            if it.get("chosen"):
+                return _parse_ror_v2_item(it)
     except Exception:
         pass
     return None
 
 
-async def _ror_expand_batch(affiliations: list[str]) -> dict[str, list[str]]:
+async def _ror_expand_batch(affiliations: list[str],
+                            overall_cap: float = ROR_OVERALL_CAP,
+                            per_request_timeout: float = ROR_TIMEOUT) -> dict[str, list[str]]:
     """
-    Query ROR for all unique affiliations concurrently.
+    Query ROR for all unique affiliations concurrently, with one shared
+    client, a semaphore, a per-request timeout and an overall cap. Results
+    of requests that finished before the cap are kept; the rest are cancelled.
     Returns { canonical → [variants] }
     """
     result: dict[str, list[str]] = {}
     sem = asyncio.Semaphore(ROR_CONCURRENCY)
 
-    async def fetch_one(aff: str):
-        async with sem:
-            async with httpx.AsyncClient() as client:
-                match = await _ror_lookup(client, aff)
-            if match and match["canonical"]:
-                canon = match["canonical"].lower()
-                variants = set()
-                variants.add(aff.lower())
-                variants.update(a.lower() for a in match["aliases"] if a)
-                variants.update(a.lower() for a in match["acronyms"] if a)
-                variants.update(l.lower() for l in match["labels"] if l)
-                variants.discard(canon)
-                if canon not in result:
-                    result[canon] = []
-                for v in variants:
-                    if v not in result[canon]:
-                        result[canon].append(v)
+    def _add(aff: str, match: dict):
+        canon = match["canonical"].lower()
+        variants = {aff.lower()}
+        variants.update(a.lower() for a in match["aliases"] if a)
+        variants.update(a.lower() for a in match["acronyms"] if a)
+        variants.update(l.lower() for l in match["labels"] if l)
+        variants.discard(canon)
+        bucket = result.setdefault(canon, [])
+        for v in variants:
+            if v not in bucket:
+                bucket.append(v)
 
-    await asyncio.gather(*[fetch_one(aff) for aff in affiliations])
+    limits = httpx.Limits(max_connections=ROR_CONCURRENCY,
+                          max_keepalive_connections=ROR_CONCURRENCY)
+    async with httpx.AsyncClient(timeout=per_request_timeout, limits=limits,
+                                 headers={"Accept": "application/json"}) as client:
+
+        async def fetch_one(aff: str):
+            async with sem:
+                try:
+                    match = await asyncio.wait_for(_ror_lookup(client, aff),
+                                                   timeout=per_request_timeout + 1)
+                except Exception:
+                    return
+            if match and match.get("canonical"):
+                _add(aff, match)
+
+        tasks = [asyncio.create_task(fetch_one(a)) for a in affiliations]
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=overall_cap)
+            for t in pending:
+                t.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
     return result
 
 
@@ -143,6 +191,7 @@ Rules:
             system=system,
             user_text=f"Group these affiliations by institution:\n{affiliations_text}",
             max_tokens=1500,
+            task="coi_expand",
         )
         raw = raw.replace("```json", "").replace("```", "").strip()
         parsed = json.loads(raw)
@@ -188,9 +237,9 @@ async def expand_affiliations(
     # ── Stage 1: ROR ──────────────────────────────────────────────────────────
     if use_ror and unique:
         try:
-            ror_result = await asyncio.wait_for(
-                _ror_expand_batch(unique),
-                timeout=min(ror_timeout * len(unique) / ROR_CONCURRENCY + 5, 30)
+            # Per-request timeouts + overall cap inside; partial results kept.
+            ror_result = await _ror_expand_batch(
+                unique, overall_cap=ROR_OVERALL_CAP, per_request_timeout=ror_timeout,
             )
             for canon, variants in ror_result.items():
                 if canon not in synonyms:
@@ -202,8 +251,6 @@ async def expand_affiliations(
                 for aff in unique:
                     if aff.lower() in variants or aff.lower() == canon:
                         ror_resolved.add(aff)
-        except asyncio.TimeoutError:
-            pass  # ROR timed out — fall through to LLM
         except Exception:
             pass
 

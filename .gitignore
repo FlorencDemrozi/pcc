@@ -9,11 +9,15 @@ frontend/node_modules/
 frontend/dist/
 
 # Build output
-build/dist/
-build/work/
+/dist/
+/build/dist/
+/build/work/
+/build/build/
+*.spec.bak
 
 # Secrets
 backend/config.json
+config.json.corrupt-*
 
 # OS
 .DS_Store

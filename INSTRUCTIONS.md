@@ -28,7 +28,7 @@ pcc-desktop/
 │   └── vite.config.js
 └── build/
     ├── build.sh
-    └── inject_build_date.py
+    └── pcc.spec
 ```
 
 ---
@@ -85,14 +85,14 @@ This runs Terser minification + the JavaScript obfuscator (configured in `vite.c
 
 ### Step 2 — Package with PyInstaller
 ```bash
-cd build
-bash build.sh
+# from the project root
+bash build/build.sh
 ```
 
 The script:
-1. Runs `inject_build_date.py` to stamp the build date into `backend/trial.py`
-2. Calls `pyinstaller` with the correct spec to bundle Python + frontend/dist into a single executable
-3. Output lands in `build/dist/`
+1. Builds the frontend and installs the Python dependencies
+2. Calls `pyinstaller` with `build/pcc.spec` to bundle Python + frontend/dist into a single executable
+3. Output lands in `dist/` (at the project root); intermediate files go to `build/work/`
 
 **macOS:** produces `ProgramChairCopilot.app`  
 **Windows:** produces `ProgramChairCopilot.exe`  
@@ -102,13 +102,13 @@ The script:
 Double-click the binary, or from the terminal:
 ```bash
 # macOS
-open build/dist/ProgramChairCopilot.app
+open dist/ProgramChairCopilot.app
 
 # Windows
-build\dist\ProgramChairCopilot.exe
+dist\ProgramChairCopilot.exe
 
 # Linux
-./build/dist/ProgramChairCopilot
+./dist/ProgramChairCopilot
 ```
 
 The app opens a browser window at **http://localhost:8000** automatically.
@@ -139,24 +139,10 @@ Log output (when running as packaged app):
 | App opens but API calls fail | Make sure the backend is running (`python main.py`) |
 | Blank page in dev mode | Check the Vite terminal for JS errors; check backend terminal for Python errors |
 | PyInstaller not found | `pip install pyinstaller` |
-| Trial days wrong | Check `backend/trial.py` — `TRIAL_DAYS = 14` |
 
 ---
 
-## 6 — Resetting the trial (development)
-
-The trial gate reads a build date stamped into `trial.py` by `inject_build_date.py`.  
-In **development mode** (`python main.py` directly, not packaged), the trial is inactive — all features are unlocked.
-
-To force a specific build date for testing:
-```python
-# trial.py — change this line temporarily
-BUILD_DATE = "2025-01-01"   # simulates an old build
-```
-
----
-
-## 7 — Adding or editing a module
+## 6 — Adding or editing a module
 
 Each module is a self-contained file in `frontend/src/modules/`. To add a new one:
 
@@ -165,4 +151,4 @@ Each module is a self-contained file in `frontend/src/modules/`. To add a new on
 3. Add an entry to the `PHASES` array in `App.jsx`
 4. Add a `case "mymodule":` to `renderModule()` in `App.jsx`
 
-If the module calls the LLM, use `callLLM(system, content, maxTokens, "task")` from `utils/api.js` — where `"task"` is one of `screening | reviews | decisions | program | emails | config`. This ensures the correct trial gate is enforced on the backend.
+If the module calls the LLM, use `callLLM(system, content, maxTokens, "task")` from `utils/api.js` — where `"task"` is a module/task name (e.g. `screening | reviews | decisions | program | emails | config`). The backend uses it to pick the fast or full model tier (configurable per module in Settings). All features are free and unrestricted — there is no trial or licence gate.

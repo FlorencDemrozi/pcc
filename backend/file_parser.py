@@ -12,18 +12,26 @@ from typing import Optional
 
 # ── Tabular parsers (deterministic) ──────────────────────────────────────────
 
+class UnsupportedFileError(ValueError):
+    """Raised for files we cannot parse; endpoints turn this into HTTP 400."""
+
+
 def parse_csv_bytes(content: bytes) -> list[dict]:
-    text = content.decode("utf-8-sig", errors="replace")
-    for delimiter in [",", ";", "\t", "|"]:
-        try:
-            reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
-            rows = [dict(r) for r in reader]
-            if rows and len(rows[0]) > 1:
-                return rows
-        except Exception:
-            continue
-    reader = csv.DictReader(io.StringIO(text))
-    return [dict(r) for r in reader]
+    text = content.decode("utf-8-sig", errors="replace").lstrip("﻿")
+    sample = text[:8192]
+    delimiter = ","
+    try:
+        delimiter = csv.Sniffer().sniff(sample, delimiters=",;\t").delimiter
+    except csv.Error:
+        delimiter = ","
+    reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
+    rows = []
+    for r in reader:
+        # Drop the None key csv uses for surplus columns, and all-empty rows
+        d = {k.strip() if isinstance(k, str) else k: v for k, v in r.items() if k is not None}
+        if any((v or "").strip() for v in d.values() if isinstance(v, str)):
+            rows.append(d)
+    return rows
 
 
 def parse_xlsx_bytes(content: bytes) -> list[dict]:
@@ -83,8 +91,9 @@ def _parse_xlsx_xml(content: bytes) -> list[dict]:
                                else v.text)
                     else:
                         val = ''
-                    # Normalise newlines embedded in cell values
-                    row[col] = val.replace('\n', ' ').replace('\r', '').strip()
+                    # Keep embedded newlines (same as the openpyxl path): EasyChair
+                    # separates keywords with newlines inside one cell.
+                    row[col] = val.replace('\r\n', '\n').replace('\r', '\n').strip()
                 if row:
                     rows_data.append(row)
         if not rows_data:
@@ -300,7 +309,10 @@ def parse_review_summary_xlsx(content: bytes) -> list[dict]:
                     "decision":   row.get("Decision", ""),
                     "score":      score,
                     "confidence": conf,
-                    "reviewer":   f"Reviewer {idx+1}",
+                    # Real reviewer identities are not in review_summary.xlsx; use a
+                    # per-paper-unique label so different people never collide.
+                    "reviewer":   f"{paper_id}-R{idx+1}",
+                    "synthetic_reviewer": True,
                     "text":       "",
                     "avg_score":  row.get("Average total score", ""),
                 })
@@ -423,6 +435,13 @@ def _detect_format(content: bytes, filename: str) -> str:
     """
     name = (filename or "").lower()
 
+    if name.endswith(".xls"):
+        # Old binary Excel (BIFF) — openpyxl cannot read it.
+        raise UnsupportedFileError(
+            f"'{filename}' is an old .xls Excel file, which is not supported. "
+            "Please re-save it as .xlsx or .csv and upload again."
+        )
+
     if name.endswith(".txt"):
         # Peek at content — use 1000 bytes so the first ***** PAPER ***** line is visible
         sample = content[:1000].decode("utf-8-sig", errors="replace")
@@ -434,7 +453,7 @@ def _detect_format(content: bytes, filename: str) -> str:
             return "easychair_list_txt"
         return "generic_txt"
 
-    if name.endswith((".xlsx", ".xls")):
+    if name.endswith((".xlsx", ".xlsm")):
         # Peek at first row headers
         try:
             rows = parse_xlsx_bytes(content[:])
@@ -461,13 +480,41 @@ def _detect_format(content: bytes, filename: str) -> str:
             pass
         return "generic_xlsx"
 
-    if name.endswith(".csv"):
+    if name.endswith((".csv", ".tsv")):
         return "generic_csv"
 
     return "unknown"
 
 
 # ── Universal entry point ─────────────────────────────────────────────────────
+
+_PARSERS = {
+    "easychair_review_txt": (parse_easychair_review_txt,),
+    "easychair_list_txt":   ("parse_easychair_list_txt", "_parse_generic_txt_reviews"),
+    "review_summary_xlsx":  (parse_review_summary_xlsx,),
+    "tpc_xlsx":             (parse_tpc_xlsx,),
+    "author_list_xlsx":     (parse_author_list_xlsx,),
+    "submissions_xlsx":     (parse_submissions_xlsx,),
+    "generic_xlsx":         (parse_xlsx_bytes,),
+    "generic_csv":          (parse_csv_bytes,),
+    "generic_txt":          ("_parse_generic_txt_reviews",),
+}
+
+
+def parse_known_format(content: bytes, filename: str) -> tuple[str, list[dict]]:
+    """
+    Synchronous (CPU-bound) part of parse_any_file: detect the format and run
+    the deterministic parsers. Returns (format, rows); rows may be empty.
+    Raises UnsupportedFileError for formats we refuse outright (e.g. .xls).
+    """
+    fmt = _detect_format(content, filename)
+    for parser in _PARSERS.get(fmt, ()):
+        fn = globals()[parser] if isinstance(parser, str) else parser
+        rows = fn(content)
+        if rows:
+            return fmt, rows
+    return fmt, []
+
 
 async def parse_any_file(
     content: bytes,
@@ -478,58 +525,14 @@ async def parse_any_file(
     """
     Parse any uploaded file into a list of dicts.
     Detects format automatically and uses the right parser.
+    Raises UnsupportedFileError (a ValueError) if nothing usable can be read —
+    endpoints should turn that into HTTP 400.
     """
-    fmt = _detect_format(content, filename)
-
-    if fmt == "easychair_review_txt":
-        rows = parse_easychair_review_txt(content)
-        if rows:
-            return rows
-
-    elif fmt == "easychair_list_txt":
-        rows = parse_easychair_list_txt(content)
-        if rows:
-            return rows
-        # Fallback to generic if our parser missed
-        rows = _parse_generic_txt_reviews(content)
-        if rows:
-            return rows
-
-    elif fmt == "review_summary_xlsx":
-        rows = parse_review_summary_xlsx(content)
-        if rows:
-            return rows
-
-    elif fmt == "tpc_xlsx":
-        rows = parse_tpc_xlsx(content)
-        if rows:
-            return rows
-
-    elif fmt == "author_list_xlsx":
-        rows = parse_author_list_xlsx(content)
-        if rows:
-            return rows
-
-    elif fmt == "submissions_xlsx":
-        rows = parse_submissions_xlsx(content)
-        if rows:
-            return rows
-
-    elif fmt == "generic_xlsx":
-        rows = parse_xlsx_bytes(content)
-        if rows:
-            return rows
-
-    elif fmt == "generic_csv":
-        rows = parse_csv_bytes(content)
-        if rows:
-            return rows
-
-    elif fmt == "generic_txt":
-        # Try generic review block parser
-        rows = _parse_generic_txt_reviews(content)
-        if rows:
-            return rows
+    import asyncio
+    # Parsing (openpyxl, regex over large text) is blocking — keep it off the event loop.
+    fmt, rows = await asyncio.to_thread(parse_known_format, content, filename)
+    if rows:
+        return rows
 
     # LLM fallback for truly unknown formats
     if use_llm_fallback:
@@ -540,10 +543,13 @@ async def parse_any_file(
         except Exception:
             pass
 
-    # Last resort
-    text = content.decode("utf-8-sig", errors="replace")
-    return [{"text": line.strip(), "paper_id": "", "score": ""}
-            for line in text.split("\n") if line.strip()]
+    if fmt == "unknown":
+        raise UnsupportedFileError(
+            f"Unrecognised file format: '{filename}'. Please upload .csv, .xlsx or an EasyChair .txt export."
+        )
+    raise UnsupportedFileError(
+        f"No usable rows could be read from '{filename}'. Check that the file has a header row and data."
+    )
 
 
 def _parse_generic_txt_reviews(content: bytes) -> list[dict]:
@@ -582,7 +588,7 @@ For review files use keys: paper_id, reviewer, score, confidence, text
 For score files use keys: paper_id, score, confidence, reviewer
 For author/PC files use keys: name, email, affiliation
 If a field is missing use empty string."""
-    raw = await llm_provider.call_llm(system=system, user_text=f"File: {filename}\n\n{text}", max_tokens=2000)
+    raw = await llm_provider.call_llm(system=system, user_text=f"File: {filename}\n\n{text}", max_tokens=2000, task="file_parse")
     raw = raw.replace("```json", "").replace("```", "").strip()
     data = json.loads(raw)
     return data if isinstance(data, list) else []

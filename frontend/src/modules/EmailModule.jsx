@@ -1,8 +1,9 @@
 import { useState } from "react";
 import { C, IS, LS } from "../utils/theme.js";
-import { SectionTitle, PrimaryButton, GhostButton } from "../components/ui.jsx";
-import { callLLM } from "../utils/api.js";
+import { SectionTitle, PrimaryButton, GhostButton, InfoBanner } from "../components/ui.jsx";
+import { callLLM, TASKS, isAbortError } from "../utils/api.js";
 import { safeParseJSON } from "../utils/helpers.js";
+import { useRunGuard } from "../utils/useRunGuard.js";
 
 const EMAIL_TYPES = [
   { id: "cfp",            label: "Call for Papers",           icon: "📢" },
@@ -51,7 +52,7 @@ function buildEmailContext(conf) {
   };
 }
 
-async function generateEmail(typeId, ctx) {
+async function generateEmail(typeId, ctx, signal) {
   const prompts = {
     cfp:            `Write a professional Call for Papers email for ${ctx.conference} (${ctx.acronym}). Conference dates: ${ctx.dates}. Venue: ${ctx.venue}. Website: ${ctx.website}. Submission deadline: ${ctx.subDeadline}. Notification: ${ctx.notifDate}. Camera-ready: ${ctx.camDeadline}. Max pages: ${ctx.maxPages}. Tracks: ${ctx.tracks || "see website"}.${ctx.scope ? "\nScope: " + ctx.scope : ""}\nUse [*CONFERENCE*] for conference name, [*ACRONYM*] for acronym, [*CONFERENCE-LINK*] for website, [*CHAIRS*] for chairs, [*TODAY*] for today's date.`,
     tpc_invite:     `Write a professional TPC member invitation email for ${ctx.conference} (${ctx.acronym}). Conference: ${ctx.dates}, ${ctx.venue}. Use [*NAME*] for recipient, [*CONFERENCE*] for conference name, [*ACRONYM*] for acronym, [*CHAIRS-INFO*] for chairs with emails, [*CONFERENCE-LINK*] for website.`,
@@ -79,7 +80,7 @@ Return ONLY valid JSON (no markdown fences):
 {"subject":"...","body":"..."}`;
 
   const prompt = prompts[typeId] || `Write a professional conference email for ${ctx.conference}.`;
-  const raw    = await callLLM(system, prompt, 1200, "emails");
+  const raw    = await callLLM(system, prompt, 1200, TASKS.email, { signal });
   const clean  = raw.replace(/^```[a-z]*\n?/, "").replace(/\n?```$/, "").trim();
   const parsed = safeParseJSON(clean);
   if (parsed && parsed.subject && parsed.body) return parsed;
@@ -93,28 +94,44 @@ export function EmailModule({ conf }) {
   const [startDate,  setStartDate]  = useState("");
   const [timeline,   setTimeline]   = useState([]);
   const [copied,     setCopied]     = useState(false);
+  const [errors,     setErrors]     = useState([]);
+  const [progress,   setProgress]   = useState("");
+  const guard = useRunGuard();
 
   const ctx  = buildEmailContext(conf);
   const cur  = emails[sel];
   const generatedCount = Object.keys(emails).length;
 
   const generate = async () => {
-    setGenerating(true);
+    const signal = guard.start();
+    setGenerating(true); setErrors([]);
     try {
-      const r = await generateEmail(sel, ctx);
+      const r = await generateEmail(sel, ctx, signal);
       setEmails(p => ({ ...p, [sel]: r }));
-    } catch (e) { alert("Error: " + e.message); }
+    } catch (e) {
+      if (!isAbortError(e)) setErrors([`${EMAIL_TYPES.find(t => t.id === sel)?.label || sel}: ${e.message}`]);
+    }
     setGenerating(false);
   };
 
   const generateAll = async () => {
-    setGenerating(true);
-    for (const t of EMAIL_TYPES) {
+    const signal = guard.start();
+    setGenerating(true); setErrors([]);
+    const failed = [];
+    for (let i = 0; i < EMAIL_TYPES.length; i++) {
+      if (guard.isCancelled()) break;
+      const t = EMAIL_TYPES[i];
+      setProgress(`${i + 1}/${EMAIL_TYPES.length}: ${t.label}`);
       try {
-        const r = await generateEmail(t.id, ctx);
+        const r = await generateEmail(t.id, ctx, signal);
         setEmails(p => ({ ...p, [t.id]: r }));
-      } catch {}
+      } catch (e) {
+        if (isAbortError(e) || guard.isCancelled()) break;
+        failed.push(`${t.label}: ${e.message}`);
+        setErrors([...failed]);
+      }
     }
+    setProgress("");
     setGenerating(false);
   };
 
@@ -215,7 +232,10 @@ export function EmailModule({ conf }) {
             </div>
           ))}
           <div style={{ marginTop: 10 }}>
-            <GhostButton onClick={generateAll} small>{generating ? "Generating…" : "Generate all →"}</GhostButton>
+            {generating
+              ? <GhostButton onClick={guard.stop} small>■ Stop</GhostButton>
+              : <GhostButton onClick={generateAll} small>Generate all →</GhostButton>}
+            {progress && <div style={{ fontSize: 10, color: C.muted, marginTop: 6 }}>Generating {progress}</div>}
             {generatedCount > 0 && <div style={{ fontSize: 10, color: C.green, marginTop: 6 }}>{generatedCount}/{EMAIL_TYPES.length} generated</div>}
           </div>
         </div>
@@ -231,6 +251,13 @@ export function EmailModule({ conf }) {
               {generating ? "Generating…" : cur ? "Regenerate" : "Generate →"}
             </PrimaryButton>
           </div>
+
+          {errors.length > 0 && (
+            <InfoBanner type="error">
+              {errors.length === 1 ? "Email generation failed — " : `${errors.length} emails failed to generate:`}
+              {errors.length === 1 ? errors[0] : errors.map((m, i) => <div key={i}>• {m}</div>)}
+            </InfoBanner>
+          )}
 
           {/* EasyChair tag reference */}
           <details style={{ marginBottom: 12 }}>

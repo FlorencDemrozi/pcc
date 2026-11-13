@@ -1,11 +1,12 @@
 import { useState } from "react";
 import { C } from "../utils/theme.js";
 import { Badge, StatCard, SectionTitle, ProgressBar, PrimaryButton, GhostButton, EmptyState } from "../components/ui.jsx";
-import { callLLM, countPagesBackend } from "../utils/api.js";
+import { callLLM, countPagesBackend, TASKS, isAbortError } from "../utils/api.js";
 import { readFileAsBase64 } from "../utils/fileParser.js";
-import { getField, matchMeta, safeParseJSON, exportCSV } from "../utils/helpers.js";
+import { getField, matchMeta, safeParseJSON, exportCSV, trackForFile, knownIdSet } from "../utils/helpers.js";
+import { useRunGuard } from "../utils/useRunGuard.js";
 
-async function runScreeningAPI(pdfBase64, meta, conf, pageCount, strictness) {
+async function runScreeningAPI(pdfBase64, meta, conf, pageCount, strictness, signal, sendMode = "text") {
   const pageInfo   = pageCount ? `The PDF has exactly ${pageCount} pages (pre-counted — treat as ground truth).` : "";
   const pageStatus = pageCount
     ? (pageCount <= (conf.maxPages || 6) ? `Page limit: PASS (${pageCount} pages, limit ${conf.maxPages || 6})` : `Page limit: FAIL (${pageCount} pages exceeds limit of ${conf.maxPages || 6})`)
@@ -45,14 +46,14 @@ Valid values:
 - novelty_signal.rating: "Strong" | "Moderate" | "Weak" | "Cannot assess"
 - soa_coverage.rating: "Adequate" | "Superficial" | "Missing" | "Cannot assess"
 - writing_quality.rating: "Good" | "Acceptable" | "Poor"
-- figure_quality.rating: "Good" | "Acceptable" | "Poor" | "N/A"
+- figure_quality.rating: "Good" | "Acceptable" | "Poor" | "N/A"${sendMode === "text" ? "\n(You receive extracted TEXT only, no figures: set figure_quality.rating to \"N/A\" and judge everything else from the text.)" : ""}
 - llm_signal.confidence: "High" | "Medium" | "Low"
 - recommendation: "Accept for review" | "Accept for review with concerns" | "Borderline" | "Desk reject"`;
 
   const text = await callLLM(system, [
     { type: "document", source: { type: "base64", media_type: "application/pdf", data: pdfBase64 } },
     { type: "text", text: `Title: ${meta.title || "N/A"}\nTrack: ${meta.track || "N/A"}\nAbstract: ${meta.abstract || "N/A"}\n\nAssess the paper quality and return only the JSON.` },
-  ], 1800, "screening");
+  ], 1800, TASKS.screening, { signal, pdfMode: sendMode });
 
   return safeParseJSON(text);
 }
@@ -64,26 +65,24 @@ export function ScreeningModule({ conf, pdfFiles, metaRows, activeTrack = "All" 
   const [expanded,   setExpanded]   = useState(null);
   const [filter,     setFilter]     = useState("All");
   const [strictness, setStrictness] = useState({ novelty: "standard", soa: "standard", writing: "standard", llm: "standard" });
+  const [sendMode,   setSendMode]   = useState("text");   // "text" (cheap) | "native" (full PDF)
 
-  const getFileTrack = filename => {
-    if (!metaRows.length) return "";
-    const matches = filename.match(/[_\-](\d{4,})/g);
-    if (!matches) return "";
-    const pid = matches[matches.length - 1].replace(/^[_\-]/, "");
-    const row = metaRows.find(r => String(r["#"] || r.paper_id || r.id || "").trim() === pid);
-    return row ? String(row.Track || row.track || "").trim() : "";
-  };
+  const guard   = useRunGuard();
+  const knownIds = knownIdSet(metaRows);
+  const getFileTrack = filename => trackForFile(filename, metaRows, knownIds);
 
   const filteredFiles = activeTrack === "All" ? pdfFiles : pdfFiles.filter(f => getFileTrack(f.name) === activeTrack);
 
   const run = async (force = false) => {
     if (papers.length > 0 && !force) return;
+    const signal = guard.start();
     setRunning(true); setPapers([]);
     const results = [];
     setProg({ done: 0, total: filteredFiles.length, cur: "" });
     for (let i = 0; i < filteredFiles.length; i++) {
+      if (guard.isCancelled()) break;
       const f    = filteredFiles[i];
-      const meta = matchMeta(f.name, metaRows);
+      const meta = matchMeta(f.name, metaRows, knownIds);
       setProg({ done: i, total: filteredFiles.length, cur: f.name });
       try {
         const b64       = await readFileAsBase64(f);
@@ -93,15 +92,17 @@ export function ScreeningModule({ conf, pdfFiles, metaRows, activeTrack = "All" 
           title:    getField(meta, "title", "Title"),
           track:    getField(meta, "track", "Track"),
           abstract: getField(meta, "abstract", "Abstract"),
-        }, conf, pageCount, strictness);
+        }, conf, pageCount, strictness, signal, sendMode);
         result._pageCount = pageCount;
         result._pagePass  = pagePass;
         results.push({ id: i + 1, filename: f.name, meta, result });
       } catch (e) {
+        if (isAbortError(e) || guard.isCancelled()) break;
         results.push({ id: i + 1, filename: f.name, meta, result: null, error: e.message });
       }
       setPapers([...results]);
     }
+    setPapers([...results]);
     setRunning(false);
   };
 
@@ -133,6 +134,23 @@ export function ScreeningModule({ conf, pdfFiles, metaRows, activeTrack = "All" 
           <div style={{ fontSize: 13, color: C.muted, marginBottom: 14 }}>
             {filteredFiles.length}{activeTrack !== "All" ? ` in "${activeTrack}"` : ""} of {pdfFiles.length} papers · {metaRows.length} metadata rows
           </div>
+          <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 10, padding: "16px 20px", marginBottom: 12 }}>
+            <SectionTitle>What to send to the model</SectionTitle>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {[
+                ["text",   "Extracted text (recommended, cheaper)", "Sends the paper text only. Reuses the text already extracted by the Compliance check. Typically 2-3x fewer input tokens; figures are not evaluated."],
+                ["native", "Full PDF",                              "Sends the whole PDF, so the model also sees figures and layout. Costs more per paper."],
+              ].map(([val, title, desc]) => (
+                <label key={val} style={{ display: "flex", gap: 10, alignItems: "flex-start", cursor: "pointer" }}>
+                  <input type="radio" checked={sendMode === val} onChange={() => setSendMode(val)} style={{ marginTop: 3, flexShrink: 0 }} />
+                  <div>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: C.text }}>{title}</div>
+                    <div style={{ fontSize: 11, color: C.muted, marginTop: 2, lineHeight: 1.5 }}>{desc}</div>
+                  </div>
+                </label>
+              ))}
+            </div>
+          </div>
           <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 10, padding: "16px 20px", marginBottom: 16 }}>
             <SectionTitle>Evaluation strictness</SectionTitle>
             <div style={{ fontSize: 12, color: C.muted, marginBottom: 12, lineHeight: 1.5 }}>
@@ -150,6 +168,7 @@ export function ScreeningModule({ conf, pdfFiles, metaRows, activeTrack = "All" 
       )}
 
       {running && <ProgressBar done={prog.done} total={prog.total} label={prog.cur} />}
+      {running && <div style={{ marginTop: -8, marginBottom: 16 }}><GhostButton small onClick={guard.stop}>■ Stop</GhostButton></div>}
 
       {papers.length > 0 && (
         <>
@@ -183,7 +202,7 @@ export function ScreeningModule({ conf, pdfFiles, metaRows, activeTrack = "All" 
               writing:        p.result?.writing_quality?.rating || "",
               llm:            p.result?.llm_signal?.flag ? "Yes" : "No",
             })), "screening.csv")}>↓ Export CSV</GhostButton>
-            {!running && <PrimaryButton onClick={run}>Re-run</PrimaryButton>}
+            {!running && <PrimaryButton onClick={() => run(true)}>Re-run</PrimaryButton>}
           </div>
 
           {filtered.map((p, i) => {

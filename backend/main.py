@@ -1,14 +1,15 @@
 """
 main.py — FastAPI backend for Program Chair Copilot.
-Key fix: /api/llm reads a "task" field and enforces the correct feature gate.
+All features are free and unrestricted. The server only listens on 127.0.0.1
+and rejects requests that do not come from a local origin.
 """
 
-import io, json, os, sys, csv, webbrowser, threading, re
+import asyncio, base64, binascii, io, json, os, sys, webbrowser, threading, re
 from pathlib import Path
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse, Response
@@ -23,14 +24,90 @@ import coi_checker
 import llm_provider
 import file_parser
 import decisions as decisions_mod
-import trial as trial_mod
+import references as references_mod
+import hashlib
+from collections import OrderedDict
+
+PORT = int(os.environ.get("PCC_PORT", "8000"))
+MAX_UPLOAD_BYTES = 200 * 1024 * 1024          # 200 MB per request
+MAX_LLM_TOKENS = 16000
+DECISION_CONCURRENCY = 4
+
+# Extracted paper text, keyed by SHA-256 of the PDF bytes. Filled by the
+# compliance check so later LLM calls (AI screening in "text" mode) reuse it
+# instead of re-extracting, and can send text instead of the whole PDF.
+_TEXT_CACHE: "OrderedDict[str, str]" = OrderedDict()
+_TEXT_CACHE_MAX = 1000
+_text_cache_lock = threading.Lock()
+
+def _cache_text(pdf_bytes: bytes, text: str) -> None:
+    key = hashlib.sha256(pdf_bytes).hexdigest()
+    with _text_cache_lock:
+        _TEXT_CACHE[key] = text
+        _TEXT_CACHE.move_to_end(key)
+        while len(_TEXT_CACHE) > _TEXT_CACHE_MAX:
+            _TEXT_CACHE.popitem(last=False)
+
+async def _paper_text(pdf_bytes: bytes) -> tuple[str, bool]:
+    """(text, from_cache)."""
+    key = hashlib.sha256(pdf_bytes).hexdigest()
+    with _text_cache_lock:
+        if key in _TEXT_CACHE:
+            return _TEXT_CACHE[key], True
+    text = await asyncio.to_thread(references_mod.extract_reading_text_from_bytes, pdf_bytes)
+    _cache_text(pdf_bytes, text)
+    return text, False
 
 app = FastAPI(title="Program Chair Copilot", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"],
-    allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+    allow_origins=[f"http://localhost:{PORT}", f"http://127.0.0.1:{PORT}"],
+    allow_credentials=False, allow_methods=["GET", "POST"], allow_headers=["*"],
 )
+
+# ── Local-only hardening ──────────────────────────────────────────────────────
+# 1. Host header must be a loopback name (blocks DNS-rebinding attacks).
+# 2. State-changing requests carrying an Origin header must come from a local
+#    http origin on any port (the packaged app on :8000, the Vite dev server on
+#    :5173 — Vite's proxy forwards the browser's Origin unchanged).
+# 3. Request bodies larger than MAX_UPLOAD_BYTES are refused with 413.
+
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+_LOCAL_ORIGIN = re.compile(r"^http://(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?$", re.IGNORECASE)
+_STATE_CHANGING = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def _host_name(host_header: str) -> str:
+    h = (host_header or "").strip().lower()
+    if h.startswith("["):                      # [::1]:8000
+        return h[1:h.find("]")] if "]" in h else h
+    return h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+
+
+@app.middleware("http")
+async def local_only_guard(request: Request, call_next):
+    if _host_name(request.headers.get("host", "")) not in _LOCAL_HOSTS:
+        return JSONResponse({"detail": "Forbidden host"}, status_code=403)
+    if request.method.upper() in _STATE_CHANGING:
+        origin = request.headers.get("origin")
+        if origin is not None and not _LOCAL_ORIGIN.match(origin.strip()):
+            return JSONResponse({"detail": "Forbidden origin"}, status_code=403)
+    cl = request.headers.get("content-length")
+    if cl:
+        try:
+            if int(cl) > MAX_UPLOAD_BYTES:
+                return JSONResponse(
+                    {"detail": f"Upload too large (limit {MAX_UPLOAD_BYTES // (1024 * 1024)} MB per request)."},
+                    status_code=413)
+        except ValueError:
+            return JSONResponse({"detail": "Invalid Content-Length"}, status_code=400)
+    return await call_next(request)
+
+
+@app.exception_handler(file_parser.UnsupportedFileError)
+async def _unsupported_file(_request: Request, exc: file_parser.UnsupportedFileError):
+    return JSONResponse({"detail": str(exc)}, status_code=400)
+
 
 def _frontend_dir() -> Optional[Path]:
     base = Path(sys._MEIPASS) if getattr(sys, "frozen", False) else Path(__file__).parent.parent
@@ -38,41 +115,69 @@ def _frontend_dir() -> Optional[Path]:
     return c if c.exists() else None
 
 _frontend = _frontend_dir()
-if _frontend:
+if _frontend and (_frontend / "assets").exists():
     app.mount("/assets", StaticFiles(directory=str(_frontend / "assets")), name="assets")
 
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def _read_upload(file: UploadFile) -> bytes:
+    """Read an upload, enforcing the size limit even without Content-Length."""
+    if file.size is not None and file.size > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"'{file.filename}' is too large (limit {MAX_UPLOAD_BYTES // (1024 * 1024)} MB).")
+    data = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"'{file.filename}' is too large (limit {MAX_UPLOAD_BYTES // (1024 * 1024)} MB).")
+    return data
+
+
+async def _parse_upload(file: UploadFile, default_name: str, purpose: str) -> list[dict]:
+    content = await _read_upload(file)
+    return await file_parser.parse_any_file(content, file.filename or default_name,
+                                            purpose=purpose, use_llm_fallback=False)
+
+
+async def _run_coro_in_thread(fn, *args, **kwargs):
+    """
+    Run an async analyser (whose body does blocking CPU/IO work before awaiting)
+    on a worker thread with its own event loop, so the server loop stays free.
+    """
+    return await asyncio.to_thread(lambda: asyncio.run(fn(*args, **kwargs)))
+
+
+def _parse_tabular_sync(content: bytes, filename: str) -> list[dict]:
+    name = (filename or "").lower()
+    if name.endswith(".xls"):
+        raise HTTPException(400, f"'{filename}' is an old .xls Excel file. Please re-save as .xlsx or .csv.")
+    if name.endswith((".csv", ".tsv")):
+        return file_parser.parse_csv_bytes(content)
+    if name.endswith((".xlsx", ".xlsm")):
+        return file_parser.parse_xlsx_bytes(content)
+    raise HTTPException(400, f"Unsupported file type: {filename}. Please upload .csv or .xlsx.")
+
+
 async def _parse_tabular(file: UploadFile) -> list[dict]:
-    content = await file.read()
-    name = (file.filename or "").lower()
-    if name.endswith(".csv"):
-        text = content.decode("utf-8-sig", errors="replace")
-        return [dict(row) for row in csv.DictReader(io.StringIO(text))]
-    elif name.endswith((".xlsx", ".xls")):
-        try:
-            import openpyxl
-            wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
-            ws = wb.active
-            rows = list(ws.iter_rows(values_only=True))
-            if not rows: return []
-            headers = [str(h or "").strip() for h in rows[0]]
-            return [{headers[i]: str(v or "").strip() for i, v in enumerate(row)} for row in rows[1:]]
-        except ImportError:
-            raise HTTPException(500, "openpyxl not installed")
-    raise HTTPException(400, f"Unsupported file type: {file.filename}")
+    content = await _read_upload(file)
+    return await asyncio.to_thread(_parse_tabular_sync, content, file.filename or "")
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 @app.get("/api/config")
-def get_config(): return config.load()
+def get_config():
+    # API keys are never returned in plaintext — only *_set / *_masked flags.
+    return config.redacted(config.load())
 
 @app.post("/api/config")
-async def save_config(body: dict): return {"ok": config.save(body)}
+async def save_config(body: dict):
+    # The llm block (and its keys) only goes through the merge logic;
+    # the legacy top-level key cannot be overwritten from here.
+    return {"ok": config.update_config(body)}
 
 @app.get("/api/config/apikey")
 def get_api_key():
     key = config.get_api_key()
-    masked = ("*" * (len(key) - 4) + key[-4:]) if len(key) > 4 else "*" * len(key)
-    return {"set": bool(key), "masked": masked}
+    return {"set": bool(key), "masked": config.mask(key)}
 
 class ApiKeyBody(BaseModel):
     key: str
@@ -99,32 +204,63 @@ async def check_pdf(
     validation_stamp: str = Form(""),
     use_llm_blind: bool = Form(False),
     author_list_json: str = Form(""),
+    refs_excluded: bool = Form(False),
 ):
-    content = await file.read()
+    content = await _read_upload(file)
     try: notices = json.loads(copyright_notices) if copyright_notices else []
-    except: notices = []
+    except Exception: notices = []
     author_names = None
-    if camera_ready and author_list_json:
+    if author_list_json:  # used by the blind check and the camera-ready author check
         try:
             author_rows = json.loads(author_list_json)
-            m = re.search(r'[_\-](\d{4,})', file.filename or "")
-            if m:
-                pid = m.group(1)
+            known = {str(r.get("paper_id") or r.get("#") or "").strip() for r in author_rows}
+            nums = re.findall(r'\d+', file.filename or "")
+            pid = next((n for n in reversed(nums) if n in known or n.lstrip("0") in known), None)
+            if pid:
+                pid = pid if pid in known else pid.lstrip("0")
                 author_names = [
                     str(r.get("name") or r.get("author") or r.get("Author") or "").strip()
                     for r in author_rows
                     if str(r.get("paper_id") or r.get("#") or "").strip() == pid
                     and (r.get("name") or r.get("author") or r.get("Author"))
                 ]
-        except: pass
-    result = await pdf_checker.check_pdf_async(
+        except Exception: pass
+    result = await _run_coro_in_thread(
+        pdf_checker.check_pdf_async,
         file_bytes=content, filename=file.filename or "unknown.pdf",
         max_pages=max_pages, double_blind=double_blind,
         copyright_strings=notices, check_camera_ready=camera_ready,
         expected_layout=expected_layout, validation_stamp=validation_stamp,
         use_llm_blind=use_llm_blind, author_names=author_names,
+        refs_excluded=refs_excluded,
     )
+    if result.reading_text:
+        _cache_text(content, result.reading_text)
     return pdf_checker.report_to_dict(result)
+
+# ── Reference verification (opt-in, network) ─────────────────────────────────
+
+@app.post("/api/check/references")
+async def check_references(file: UploadFile = File(...), verify: bool = Form(False)):
+    """Citation cross-check; with verify=true also looks every reference up in
+    Crossref/OpenAlex. Only the reference strings leave the machine."""
+    content = await _read_upload(file)
+    try:
+        text, _ = await _paper_text(content)
+    except Exception:
+        raise HTTPException(400, "Could not open PDF (encrypted or corrupt).")
+    analysis = references_mod.analyse_citations(text)
+    out = {k: analysis[k] for k in ("status", "style", "cited_count", "uncited", "missing")}
+    out["entries"] = analysis["entries"]
+    if verify and analysis["entries"]:
+        oa_key = (config.get_llm_config() or {}).get("openalex_key", "")
+        results = await references_mod.verify_references(analysis["entries"], openalex_key=oa_key)
+        out["verification"] = results
+        out["verification_summary"] = {
+            s: sum(1 for r in results if r["status"] == s)
+            for s in ("verified", "likely", "not_found", "not_checkable", "error")
+        }
+    return out
 
 # ── Meta checker ──────────────────────────────────────────────────────────────
 
@@ -139,8 +275,9 @@ async def check_meta(
     try:
         tracks = json.loads(valid_tracks) if valid_tracks else None
         req_fields = json.loads(required_fields) if required_fields else None
-    except: tracks = req_fields = None
-    result = meta_checker.check_metadata(
+    except Exception: tracks = req_fields = None
+    result = await asyncio.to_thread(
+        meta_checker.check_metadata,
         rows=rows, required_fields=req_fields,
         min_abstract_words=min_abstract_words, max_abstract_words=max_abstract_words,
         min_keywords=min_keywords, max_keywords=max_keywords, valid_tracks=tracks,
@@ -158,17 +295,11 @@ async def review_statistics(
     max_load_per_reviewer: int = Form(8),
     high_variance_threshold: float = Form(1.5),
 ):
-    rc = await reviews_file.read()
-    review_rows = await file_parser.parse_any_file(rc, reviews_file.filename or "reviews", purpose="review scores", use_llm_fallback=False)
-    submission_rows = []
-    if submissions_file:
-        sc = await submissions_file.read()
-        submission_rows = await file_parser.parse_any_file(sc, submissions_file.filename or "submissions", purpose="paper IDs", use_llm_fallback=False)
-    assignment_rows = []
-    if assignments_file:
-        ac = await assignments_file.read()
-        assignment_rows = await file_parser.parse_any_file(ac, assignments_file.filename or "assignments", purpose="assignments", use_llm_fallback=False)
-    result = review_stats.compute_stats(
+    review_rows = await _parse_upload(reviews_file, "reviews", "review scores")
+    submission_rows = await _parse_upload(submissions_file, "submissions", "paper IDs") if submissions_file else []
+    assignment_rows = await _parse_upload(assignments_file, "assignments", "assignments") if assignments_file else []
+    result = await asyncio.to_thread(
+        review_stats.compute_stats,
         review_rows=review_rows, submission_rows=submission_rows, assignment_rows=assignment_rows,
         min_reviews_per_paper=min_reviews_per_paper, max_load_per_reviewer=max_load_per_reviewer,
         high_variance_threshold=high_variance_threshold,
@@ -178,24 +309,33 @@ async def review_statistics(
 # ── LLM config ────────────────────────────────────────────────────────────────
 
 class LLMConfigBody(BaseModel):
-    provider: str; claude_key: str = ""; openai_key: str = ""
-    gemini_key: str = ""; groq_key: str = ""; ollama_url: str = "http://localhost:11434"; models: dict = {}
+    # Keys: empty / missing = keep the stored key. Use clear_keys to remove one.
+    provider: str = ""
+    claude_key: str = ""; openai_key: str = ""; gemini_key: str = ""; groq_key: str = ""
+    openalex_key: str = ""   # optional, used only for reference verification
+    clear_keys: list[str] = []
+    ollama_url: str = ""
+    models: dict = {}
+    module_tiers: dict = {}   # { moduleName: "fast" | "full" }
 
 @app.get("/api/config/llm")
 def get_llm_config():
     cfg = config.get_llm_config()
-    def mask(k): return ("*"*(len(k)-4)+k[-4:]) if len(k)>4 else "*"*len(k)
-    return {
-        "provider": cfg.get("provider","claude"),
-        "claude_key_set": bool(cfg.get("claude_key")), "claude_key_masked": mask(cfg.get("claude_key","")),
-        "openai_key_set": bool(cfg.get("openai_key")), "openai_key_masked": mask(cfg.get("openai_key","")),
-        "gemini_key_set": bool(cfg.get("gemini_key")), "gemini_key_masked": mask(cfg.get("gemini_key","")),
-        "groq_key_set":   bool(cfg.get("groq_key")),   "groq_key_masked":   mask(cfg.get("groq_key","")),
-        "ollama_url": cfg.get("ollama_url","http://localhost:11434"), "models": cfg.get("models",{}),
+    out = {
+        "provider": cfg.get("provider", "claude"),
+        "ollama_url": cfg.get("ollama_url", "http://localhost:11434"),
+        "models": cfg.get("models", {}) or {},
+        "module_tiers": cfg.get("module_tiers", {}) or {},
     }
+    for k in config.KEY_FIELDS:
+        val = cfg.get(k, "") or ""
+        out[f"{k}_set"] = bool(val)
+        out[f"{k}_masked"] = config.mask(val)
+    return out
 
 @app.post("/api/config/llm")
-async def save_llm_config(body: LLMConfigBody): return {"ok": config.set_llm_config(body.dict())}
+async def save_llm_config(body: LLMConfigBody):
+    return {"ok": config.set_llm_config(body.model_dump())}
 
 @app.get("/api/config/llm/providers")
 def list_providers(): return llm_provider.PROVIDERS
@@ -203,48 +343,70 @@ def list_providers(): return llm_provider.PROVIDERS
 @app.post("/api/config/llm/test")
 async def test_provider(): return await llm_provider.check_provider_health()
 
-# ── LLM proxy — FIXED: uses "task" field to enforce correct feature gate ──────
-
-_TASK_FEATURE = {
-    "screening": "screening", "reviews": "reviews", "decisions": "decisions",
-    "program": "program",     "emails": "emails",   "config": "config",
-}
+# ── LLM proxy — "task" selects the model tier (fast/full, per Settings) ───────
 
 @app.post("/api/llm")
 async def llm_proxy(body: dict):
-    task    = body.get("task", "screening")
-    feature = _TASK_FEATURE.get(task, "screening")
-    trial_mod.require_full_access(feature)
+    task      = str(body.get("task") or "default")[:64]
+    system    = str(body.get("system") or "")
+    user_text = str(body.get("user_text") or "")
+    pdf_b64   = body.get("pdf_b64")
+    pdf_mode  = str(body.get("pdf_mode") or "native")   # "native" | "text"
 
-    system     = body.get("system", "")
-    user_text  = body.get("user_text", "")
-    pdf_b64    = body.get("pdf_b64")
-    max_tokens = body.get("max_tokens", 1800)
+    raw_max = body.get("max_tokens", 1800)
+    try:
+        if isinstance(raw_max, bool): raise ValueError
+        max_tokens = int(raw_max)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "max_tokens must be an integer.")
+    max_tokens = max(1, min(max_tokens, MAX_LLM_TOKENS))
 
     pdf_bytes = None
     if pdf_b64:
-        import base64
-        pdf_bytes = base64.b64decode(pdf_b64)
+        if not isinstance(pdf_b64, str):
+            raise HTTPException(400, "pdf_b64 must be a base64 string.")
+        if pdf_b64.startswith("data:") and "," in pdf_b64:
+            pdf_b64 = pdf_b64.split(",", 1)[1]
+        try:
+            pdf_bytes = base64.b64decode(pdf_b64, validate=True)
+        except (binascii.Error, ValueError):
+            raise HTTPException(400, "pdf_b64 is not valid base64.")
+
+    if pdf_bytes is not None and pdf_mode == "text":
+        # Cheaper: send the extracted text (reused from the compliance check
+        # when available) instead of the whole PDF.
+        try:
+            text, _ = await _paper_text(pdf_bytes)
+        except Exception:
+            text = ""
+        if text.strip():
+            user_text = (f"{user_text}\n\n=== PAPER TEXT (extracted from PDF; figures not included) ===\n"
+                         f"{text[:80000]}")
+            pdf_bytes = None
 
     try:
-        result = await llm_provider.call_llm(system=system, user_text=user_text, pdf_bytes=pdf_bytes, max_tokens=max_tokens)
+        result = await llm_provider.call_llm(system=system, user_text=user_text, pdf_bytes=pdf_bytes,
+                                             max_tokens=max_tokens, task=task)
         return {"text": result}
     except Exception as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, llm_provider.scrub(str(e)))
 
 # Backwards-compat alias
 @app.post("/api/claude")
 async def claude_proxy_compat(body: dict):
-    trial_mod.require_full_access("screening")
     api_key = config.get_api_key()
     if not api_key: raise HTTPException(400, "API key not configured.")
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        response = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json=body,
-        )
-    if response.status_code != 200: raise HTTPException(response.status_code, response.text)
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json=body,
+            )
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Claude: network error ({type(e).__name__}).")
+    if response.status_code != 200:
+        raise HTTPException(response.status_code, llm_provider.scrub(response.text[:2000]))
     return response.json()
 
 # ── COI checker ───────────────────────────────────────────────────────────────
@@ -254,28 +416,28 @@ async def check_coi(
     submissions_file: UploadFile = File(...), tpc_file: UploadFile = File(...),
     author_list_file: Optional[UploadFile] = File(None),
     extra_synonyms: str = Form(""), fuzzy_threshold: int = Form(75),
-    use_ror: bool = Form(True), use_llm_expand: bool = Form(True),
+    # Network lookups are opt-in: everything runs locally unless the user enables them.
+    use_ror: bool = Form(False), use_llm_expand: bool = Form(False),
 ):
     try:
-        sub_content = await submissions_file.read()
-        tpc_content = await tpc_file.read()
-        submission_rows = await file_parser.parse_any_file(sub_content, submissions_file.filename or "submissions", purpose="paper ID, title, authors", use_llm_fallback=False)
-        tpc_rows = await file_parser.parse_any_file(tpc_content, tpc_file.filename or "tpc_members", purpose="TPC member name, email, affiliation", use_llm_fallback=False)
+        submission_rows = await _parse_upload(submissions_file, "submissions", "paper ID, title, authors")
+        tpc_rows = await _parse_upload(tpc_file, "tpc_members", "TPC member name, email, affiliation")
         author_rows = None
         if author_list_file:
-            auth_content = await author_list_file.read()
-            author_rows = await file_parser.parse_any_file(auth_content, author_list_file.filename or "author_list", purpose="paper ID, author name, email, affiliation", use_llm_fallback=False)
+            author_rows = await _parse_upload(author_list_file, "author_list", "paper ID, author name, email, affiliation")
         if not submission_rows: raise HTTPException(400, "Could not parse submissions file.")
         if not tpc_rows: raise HTTPException(400, "Could not parse TPC members file.")
         try: synonyms = json.loads(extra_synonyms) if extra_synonyms else {}
-        except: synonyms = {}
-        result = await coi_checker.check_coi_async(
+        except Exception: synonyms = {}
+        result = await _run_coro_in_thread(
+            coi_checker.check_coi_async,
             submission_rows=submission_rows, tpc_rows=tpc_rows, author_rows=author_rows,
             extra_synonyms=synonyms, fuzzy_threshold=fuzzy_threshold, use_ror=use_ror, use_llm=use_llm_expand,
         )
         return coi_checker.report_to_dict(result)
     except HTTPException: raise
-    except Exception as e: raise HTTPException(500, f"COI check failed: {str(e)}")
+    except file_parser.UnsupportedFileError as e: raise HTTPException(400, str(e))
+    except Exception as e: raise HTTPException(500, llm_provider.scrub(f"COI check failed: {e}"))
 
 # ── Decisions ─────────────────────────────────────────────────────────────────
 
@@ -285,48 +447,50 @@ async def run_decisions(
     submissions_file: Optional[UploadFile] = File(None),
     custom_prompt: str = Form(""),
 ):
-    trial_mod.require_full_access("decisions")
-    rev_content = await reviews_file.read()
-    review_rows = await file_parser.parse_any_file(rev_content, reviews_file.filename or "reviews", purpose="paper ID, reviewer, score, review text", use_llm_fallback=False)
+    review_rows = await _parse_upload(reviews_file, "reviews", "paper ID, reviewer, score, review text")
     submission_rows = []
     if submissions_file:
-        sub_content = await submissions_file.read()
-        submission_rows = await file_parser.parse_any_file(sub_content, submissions_file.filename or "submissions", purpose="paper ID, title, authors", use_llm_fallback=False)
-    papers = decisions_mod.group_reviews_by_paper(review_rows, submission_rows)
-    results = [await decisions_mod.decide_paper(paper, custom_prompt) for paper in papers.values()]
-    return {"decisions": results, "total": len(results)}
+        submission_rows = await _parse_upload(submissions_file, "submissions", "paper ID, title, authors")
+    papers = await asyncio.to_thread(decisions_mod.group_reviews_by_paper, review_rows, submission_rows)
+
+    sem = asyncio.Semaphore(DECISION_CONCURRENCY)
+    async def _decide(paper):
+        async with sem:
+            return await decisions_mod.decide_paper(paper, custom_prompt)
+    results = await asyncio.gather(*(_decide(p) for p in papers.values()))
+    return {"decisions": list(results), "total": len(results)}
 
 @app.post("/api/decisions/export/csv")
 async def export_decisions_csv(body: dict):
-    return Response(content=decisions_mod.decisions_to_csv(body.get("decisions", [])), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=decisions.csv"})
+    data = await asyncio.to_thread(decisions_mod.decisions_to_csv, body.get("decisions", []))
+    return Response(content=data, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=decisions.csv"})
 
 @app.post("/api/decisions/export/xlsx")
 async def export_decisions_xlsx(body: dict):
-    return Response(content=decisions_mod.decisions_to_xlsx(body.get("decisions", [])), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": "attachment; filename=decisions.xlsx"})
+    data = await asyncio.to_thread(decisions_mod.decisions_to_xlsx, body.get("decisions", []))
+    return Response(content=data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": "attachment; filename=decisions.xlsx"})
 
 # ── Parse reviews ─────────────────────────────────────────────────────────────
 
 @app.post("/api/parse/reviews")
 async def parse_reviews(reviews_file: UploadFile = File(...)):
-    content = await reviews_file.read()
-    rows = await file_parser.parse_any_file(content, reviews_file.filename or "reviews", purpose="paper ID, reviewer, score, review text", use_llm_fallback=False)
-    return [{k: str(v or "").replace("\r\n"," ").replace("\r"," ").replace("\n"," ").strip() for k,v in row.items() if not k.startswith("_")} for row in rows]
+    rows = await _parse_upload(reviews_file, "reviews", "paper ID, reviewer, score, review text")
+    return [{k: (v if isinstance(v, bool) else str(v or "").replace("\r\n"," ").replace("\r"," ").replace("\n"," ").strip())
+             for k, v in row.items() if not k.startswith("_")} for row in rows]
 
-# ── Trial & health ────────────────────────────────────────────────────────────
-
-@app.get("/api/trial")
-def get_trial(): return trial_mod.get_trial_status()
+# ── Health & quit ─────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
 def health(): return {"status": "ok", "api_key_set": bool(config.get_api_key()), "version": "1.0.0"}
 
 @app.post("/api/quit")
 def quit_app():
+    # POST-only; covered by the Host/Origin guard above.
     def _shutdown():
         import time; time.sleep(0.5)
         try:
             import signal; os.kill(os.getpid(), signal.SIGTERM)
-        except: pass
+        except Exception: pass
         time.sleep(0.3); os._exit(0)
     threading.Thread(target=_shutdown, daemon=True).start()
     return {"ok": True}
@@ -335,6 +499,8 @@ def quit_app():
 
 @app.get("/{full_path:path}")
 def serve_frontend(full_path: str):
+    if full_path == "api" or full_path.startswith("api/"):
+        return JSONResponse({"detail": "Not Found"}, status_code=404)
     if _frontend is None: return JSONResponse({"error": "Frontend not built"}, status_code=404)
     index = _frontend / "index.html"
     if not index.exists(): return JSONResponse({"error": "index.html not found"}, status_code=404)
@@ -351,7 +517,9 @@ if __name__ == "__main__":
         if sys.stderr is None: sys.stderr = log_file
 
     def _open_browser():
-        import time; time.sleep(1.5); webbrowser.open("http://localhost:8000")
+        import time; time.sleep(1.5); webbrowser.open(f"http://localhost:{PORT}")
 
-    threading.Thread(target=_open_browser, daemon=True).start()
-    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")
+    if not os.environ.get("PCC_NO_BROWSER"):
+        threading.Thread(target=_open_browser, daemon=True).start()
+    # Bind to loopback only — never expose the server on the network.
+    uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="warning")
