@@ -9,6 +9,7 @@ import { ConfigTab }           from "./modules/ConfigTab.jsx";
 import { AboutModule }         from "./modules/AboutModule.jsx";
 import { OverviewModule } from "./modules/OverviewModule.jsx";
 import { ComplianceModule }    from "./modules/ComplianceModule.jsx";
+import { PreReviewModule }     from "./modules/PreReviewModule.jsx";
 import { ReviewStatsModule }   from "./modules/ReviewStatsModule.jsx";
 import { ScreeningModule }     from "./modules/ScreeningModule.jsx";
 import { ReviewQualityModule } from "./modules/ReviewQualityModule.jsx";
@@ -28,6 +29,7 @@ const PHASES = [
   ]},
   { label:"Review", icon:"📋", modules:[
     { id:"compliance",label:"Compliance",    icon:"✅", desc:"Instant PDF checks: pages, fonts, blind compliance, references." },
+    { id:"prereview", label:"Pre-review screening", icon:"🛡", desc:"Evidence-based screening: integrity, format, anonymity, references, hidden text, numbers. Saved locally with your decisions." },
     { id:"stats",     label:"Review stats",  icon:"📊", desc:"Score distributions, reviewer calibration, accept/reject rates." },
     { id:"screening", label:"AI screening",  icon:"🔬", desc:"AI quality assessment per paper: novelty, SoA, writing, LLM detection." },
     { id:"reviews",   label:"Review quality",icon:"📋", desc:"AI assessment of each reviewer's text quality and completeness." },
@@ -166,6 +168,7 @@ export default function App(){
       case "data":       return <DataTab pdfFiles={pdfFiles} setPdfFiles={setPdfFiles} metaRows={metaRows} setMetaRows={setMetaRows} reviewRows={reviewRows} setReviewRows={setReviewRows} tpcRows={tpcRows} setTpcRows={setTpcRows} authorRows={authorRows} setAuthorRows={setAuthorRows} ssRows={ssRows} setSsRows={setSsRows}/>;
       case "overview":   return <OverviewModule conf={conf} metaRows={metaRows} authorRows={authorRows} tpcRows={tpcRows} reviewRows={reviewRows} pdfFiles={pdfFiles} activeTrack={activeTrack}/>;
       case "compliance": return <ComplianceModule conf={conf} pdfFiles={pdfFiles} metaRows={metaRows} authorRows={authorRows} activeTrack={activeTrack}/>;
+      case "prereview":  return <PreReviewModule conf={conf} pdfFiles={pdfFiles} metaRows={metaRows} authorRows={authorRows} activeTrack={activeTrack}/>;
       case "stats":      return <ReviewStatsModule reviewRows={reviewRows} metaRows={metaRows} activeTrack={activeTrack}/>;
       case "screening":  return <ScreeningModule conf={conf} pdfFiles={pdfFiles} metaRows={metaRows} activeTrack={activeTrack}/>;
       case "reviews":    return <ReviewQualityModule conf={conf} metaRows={metaRows} reviewRows={reviewRows} activeTrack={activeTrack}/>;
