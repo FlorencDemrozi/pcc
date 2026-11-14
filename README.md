@@ -37,7 +37,18 @@ Your files  →  PCC (local)  →  Your LLM API  →  Results
 
 ## Getting started
 
-**Download** a pre-built binary from the [releases page](../../releases), or build from source:
+**Download** the app for your platform from the [website](https://florencdemrozi.github.io/pcc/#download) or the [latest release](../../releases/latest):
+
+| Platform | File |
+|---|---|
+| Windows 10/11 (x64) | `ProgramChairCopilot-windows-x64.exe` |
+| macOS, Apple Silicon | `ProgramChairCopilot-macos-arm64.zip` |
+| macOS, Intel | `ProgramChairCopilot-macos-intel.zip` |
+| Linux x64 | `ProgramChairCopilot-linux-x64.tar.gz` |
+
+The binaries are not code-signed yet: on Windows click *More info → Run anyway*; on macOS right-click the app → *Open* the first time.
+
+Or build from source:
 
 ```bash
 # 1. Install dependencies

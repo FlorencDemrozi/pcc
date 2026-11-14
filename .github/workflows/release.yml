@@ -1,0 +1,115 @@
+# Builds Program Chair Copilot for Windows, macOS and Linux and publishes
+# the binaries on a GitHub Release.
+#
+#   Publish a version:   git tag v1.1.0 && git push origin v1.1.0
+#   Test without publishing: Actions tab -> "Build & release" -> Run workflow
+#                        (the binaries appear as downloadable artifacts of the run)
+#
+# PyInstaller cannot cross-compile, so each platform is built on its own runner.
+# The website links to releases/latest/download/<asset name>, so the asset
+# names below must stay stable.
+
+name: Build & release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create the release
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false   # one platform failing must not cancel the others
+      matrix:
+        include:
+          - os: windows-latest
+            asset: ProgramChairCopilot-windows-x64.exe
+          - os: macos-14            # Apple Silicon (M1/M2/M3/M4)
+            asset: ProgramChairCopilot-macos-arm64.zip
+          - os: macos-15-intel      # Intel Macs
+            asset: ProgramChairCopilot-macos-intel.zip
+          - os: ubuntu-22.04        # older glibc -> runs on more distributions
+            asset: ProgramChairCopilot-linux-x64.tar.gz
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install Python dependencies
+        run: python -m pip install -r backend/requirements.txt pyinstaller
+
+      - name: Package with PyInstaller
+        run: python -m PyInstaller build/pcc.spec --distpath dist --workpath build/work --noconfirm --clean
+
+      # ── Name / pack the result per platform ─────────────────────────────────
+      - name: Pack (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p out
+          cp dist/ProgramChairCopilot.exe "out/${{ matrix.asset }}"
+
+      - name: Pack (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p out
+          # ditto keeps the .app bundle's permissions and metadata intact
+          ditto -c -k --keepParent dist/ProgramChairCopilot.app "out/${{ matrix.asset }}"
+
+      - name: Pack (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p out
+          chmod +x dist/ProgramChairCopilot
+          # tar keeps the executable bit (a plain download would lose it)
+          tar -czf "out/${{ matrix.asset }}" -C dist ProgramChairCopilot
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: out/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    # Publish whatever built, but only for version tags (not for manual test runs)
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd out
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

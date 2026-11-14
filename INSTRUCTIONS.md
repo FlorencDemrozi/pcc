@@ -115,6 +115,25 @@ The app opens a browser window at **http://localhost:8000** automatically.
 
 ---
 
+### Publishing Windows, macOS and Linux builds
+
+PyInstaller only builds for the system it runs on, so release binaries are
+built by GitHub Actions (`.github/workflows/release.yml`) on Windows, macOS
+(Apple Silicon and Intel) and Linux runners:
+
+```bash
+git tag v1.1.0
+git push origin v1.1.0
+```
+
+The workflow attaches the four files plus `SHA256SUMS.txt` to a GitHub Release.
+The website's download buttons point at `releases/latest/download/<file>`, so
+they always serve the newest release; keep the file names unchanged.
+To test the builds without publishing, run the workflow manually from the
+Actions tab: the binaries appear as artifacts of that run.
+
+---
+
 ## 4 — Configuration storage
 
 API keys and LLM config are stored at:

@@ -120,6 +120,26 @@ nav{position:sticky;top:0;z-index:100;background:var(--nav-bg);backdrop-filter:b
 .platforms{display:flex;gap:12px;margin-top:36px;flex-wrap:wrap}
 .plat{background:var(--panel2);border:1px solid var(--border);border-radius:7px;padding:12px 18px;display:flex;align-items:center;gap:9px;font-size:13px;font-weight:500;transition:background .3s,border-color .3s}
 
+/* Download */
+.dl-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:40px}
+.dl-card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:24px;display:flex;flex-direction:column;gap:12px;transition:border-color .2s,background .3s,box-shadow .2s}
+.dl-card.is-you{border-color:var(--gold);box-shadow:0 0 0 1px var(--gold),var(--shadow)}
+.dl-head{display:flex;align-items:center;gap:10px;font-size:17px;font-weight:700}
+.dl-ico{font-size:22px}
+.dl-you{margin-left:auto;font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--gold-text);background:var(--glow);border:1px solid var(--gold);border-radius:4px;padding:1px 6px;display:none}
+.dl-card.is-you .dl-you{display:inline-block}
+.dl-req{font-size:12px;color:var(--muted)}
+.dl-btns{display:flex;flex-direction:column;gap:8px}
+.dl-btn{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 14px;border-radius:7px;font-size:14px;font-weight:600;text-decoration:none;border:1px solid var(--border2);color:var(--text);background:var(--panel2);transition:background .15s,border-color .15s}
+.dl-btn:hover{border-color:var(--gold)}
+.dl-btn.primary{background:var(--gold);border-color:var(--gold);color:#fff}
+.dl-btn.primary:hover{background:var(--gold2)}
+.dl-btn small{font-size:11px;font-weight:500;opacity:.8;font-family:'JetBrains Mono',monospace}
+.dl-note{font-size:12px;color:var(--soft);line-height:1.6;border-top:1px solid var(--border);padding-top:10px}
+.dl-note code{font-family:'JetBrains Mono',monospace;font-size:11px;background:var(--panel2);padding:1px 4px;border-radius:3px;word-break:break-all}
+.dl-foot{margin-top:22px;font-size:13px;color:var(--muted)}
+.dl-foot a{color:var(--gold-text)}
+
 /* Feedback */
 .feedback-band{background:var(--panel2);border-top:1px solid var(--border);border-bottom:1px solid var(--border);transition:background .3s,border-color .3s}
 .feedback-inner{display:grid;grid-template-columns:1fr 1fr;gap:56px;align-items:center}
@@ -174,6 +194,7 @@ footer{border-top:1px solid var(--border);padding:28px 0}
 @media(max-width:768px){
   .hero-grid,.feedback-inner,.about-grid{grid-template-columns:1fr}
   .feat-grid{grid-template-columns:1fr}
+  .dl-grid{grid-template-columns:1fr}
   .stats-row{grid-template-columns:1fr 1fr}
   .steps{grid-template-columns:1fr 1fr;gap:28px}
   .steps::before{display:none}
@@ -196,6 +217,7 @@ footer{border-top:1px solid var(--border);padding:28px 0}
     <ul class="nav-links">
       <li><a href="#features">Features</a></li>
       <li><a href="#how">How it works</a></li>
+      <li><a href="#download">Download</a></li>
       <li><a href="#feedback">Feedback</a></li>
       <li><a href="#about">About</a></li>
     </ul>
@@ -204,7 +226,7 @@ footer{border-top:1px solid var(--border);padding:28px 0}
       <button class="toggle-btn" id="themeBtn" aria-label="Toggle light/dark mode"></button>
       <span class="toggle-icon">🌙</span>
     </div>
-    <a href="https://github.com/FlorencDemrozi/pcc" class="nav-cta">Get the tool →</a>
+    <a href="#download" class="nav-cta">Download →</a>
   </div>
 </nav>
 
@@ -217,7 +239,7 @@ footer{border-top:1px solid var(--border);padding:28px 0}
         <h1>The part of your<br>conference that <em>runs itself.</em></h1>
         <p class="hero-sub">A free desktop tool that automates the repetitive work of running an academic conference — PDF compliance, COI detection, review analysis, program building, and more.</p>
         <div class="hero-actions">
-          <a href="https://github.com/FlorencDemrozi/pcc" class="btn-primary">Download for free →</a>
+          <a href="#download" class="btn-primary" id="heroDl">Download for free →</a>
           <a href="#features" class="btn-ghost">See all features</a>
         </div>
         <div class="hero-chips">
@@ -350,6 +372,43 @@ footer{border-top:1px solid var(--border);padding:28px 0}
   </div>
 </section>
 
+<!-- Download -->
+<section id="download">
+  <div class="container">
+    <p class="sec-label">Download</p>
+    <h2 class="sec-title">Get Program Chair Copilot</h2>
+    <p class="sec-sub">One file per platform, free. Nothing to install: download, open, and the app appears in your browser at <code>localhost:8000</code>.</p>
+    <div class="dl-grid">
+      <div class="dl-card" data-os="windows">
+        <div class="dl-head"><span class="dl-ico">🪟</span>Windows<span class="dl-you">Your system</span></div>
+        <div class="dl-req">Windows 10 or 11 · 64-bit</div>
+        <div class="dl-btns">
+          <a class="dl-btn primary" href="https://github.com/FlorencDemrozi/pcc/releases/latest/download/ProgramChairCopilot-windows-x64.exe">Download .exe <small>x64</small></a>
+        </div>
+        <div class="dl-note">First launch: if Windows SmartScreen says “Windows protected your PC”, click <b>More info</b> → <b>Run anyway</b>. The app is not code-signed yet.</div>
+      </div>
+      <div class="dl-card" data-os="mac">
+        <div class="dl-head"><span class="dl-ico">🍎</span>macOS<span class="dl-you">Your system</span></div>
+        <div class="dl-req">macOS 12 or later</div>
+        <div class="dl-btns">
+          <a class="dl-btn primary" data-arch="arm" href="https://github.com/FlorencDemrozi/pcc/releases/latest/download/ProgramChairCopilot-macos-arm64.zip">Apple Silicon <small>M1–M4</small></a>
+          <a class="dl-btn" data-arch="intel" href="https://github.com/FlorencDemrozi/pcc/releases/latest/download/ProgramChairCopilot-macos-intel.zip">Intel Mac <small>x64</small></a>
+        </div>
+        <div class="dl-note">Unzip, then <b>right-click</b> the app → <b>Open</b> → <b>Open</b> (needed once; the app is not notarised yet). If macOS still refuses: <code>xattr -dr com.apple.quarantine ProgramChairCopilot.app</code></div>
+      </div>
+      <div class="dl-card" data-os="linux">
+        <div class="dl-head"><span class="dl-ico">🐧</span>Linux<span class="dl-you">Your system</span></div>
+        <div class="dl-req">x64 · Ubuntu 22.04+ or similar (glibc 2.35+)</div>
+        <div class="dl-btns">
+          <a class="dl-btn primary" href="https://github.com/FlorencDemrozi/pcc/releases/latest/download/ProgramChairCopilot-linux-x64.tar.gz">Download .tar.gz <small>x64</small></a>
+        </div>
+        <div class="dl-note">Extract and run: <code>tar -xzf ProgramChairCopilot-linux-x64.tar.gz &amp;&amp; ./ProgramChairCopilot</code></div>
+      </div>
+    </div>
+    <p class="dl-foot">All versions, release notes and SHA-256 checksums: <a href="https://github.com/FlorencDemrozi/pcc/releases" target="_blank" rel="noopener">GitHub releases</a> · Prefer to build it yourself? <a href="https://github.com/FlorencDemrozi/pcc" target="_blank" rel="noopener">Source code</a></p>
+  </div>
+</section>
+
 <!-- Feedback -->
 <section id="feedback" class="feedback-band">
   <div class="container">
@@ -430,7 +489,7 @@ footer{border-top:1px solid var(--border);padding:28px 0}
   <div class="container">
     <h2>Try it on your next conference</h2>
     <p>Takes two minutes to get started.</p>
-    <a href="https://github.com/FlorencDemrozi/pcc" class="btn-primary" style="font-size:16px;padding:14px 32px;display:inline-flex">Download for free →</a>
+    <a href="#download" class="btn-primary" style="font-size:16px;padding:14px 32px;display:inline-flex">Download for free →</a>
     <a href="mailto:florenc1991@gmail.com" class="cta-email">florenc1991@gmail.com</a>
   </div>
 </div>
@@ -450,6 +509,20 @@ footer{border-top:1px solid var(--border);padding:28px 0}
 </footer>
 
 <script>
+// Download: highlight the visitor's platform (a hint only; every download stays visible)
+(function () {
+  const ua = navigator.userAgent || '';
+  const plat = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '';
+  const os = /Win/i.test(plat + ua) ? 'windows' : /Mac/i.test(plat + ua) && !/iPhone|iPad/i.test(ua) ? 'mac'
+           : /Linux|X11/i.test(plat + ua) && !/Android/i.test(ua) ? 'linux' : null;
+  if (!os) return;
+  const card = document.querySelector('.dl-card[data-os="' + os + '"]');
+  if (card) card.classList.add('is-you');
+  const label = { windows: 'Download for Windows →', mac: 'Download for macOS →', linux: 'Download for Linux →' }[os];
+  const hero = document.getElementById('heroDl');
+  if (hero) hero.textContent = label;
+})();
+
 // Theme
 const html = document.documentElement;
 const btn  = document.getElementById('themeBtn');
