@@ -123,6 +123,13 @@ API keys and LLM config are stored at:
 
 Keys are never transmitted anywhere except to your chosen LLM provider.
 
+Pre-review screening results, chair decisions (with their history), the
+extracted-text cache and cached DOI/Crossref lookups are stored in one SQLite
+file per conference (Python's built-in `sqlite3`, nothing to install):
+- `~/.pcc/prereview/<conference>.db` (e.g. `vlsi-soc-2026.db`)
+
+Delete that file to start a conference's screening from scratch.
+
 Log output (when running as packaged app):
 - **macOS/Linux:** `~/.pcc/pcc.log`
 - **Windows:** `C:\Users\<you>\.pcc\pcc.log`

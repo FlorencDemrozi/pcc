@@ -25,6 +25,8 @@ import llm_provider
 import file_parser
 import decisions as decisions_mod
 import references as references_mod
+import prereview  # noqa: F401  (registers the screening checks)
+from prereview import runner as prereview_runner, store as prereview_store, docmodel as prereview_docmodel
 import hashlib
 from collections import OrderedDict
 
@@ -477,6 +479,90 @@ async def parse_reviews(reviews_file: UploadFile = File(...)):
     rows = await _parse_upload(reviews_file, "reviews", "paper ID, reviewer, score, review text")
     return [{k: (v if isinstance(v, bool) else str(v or "").replace("\r\n"," ").replace("\r"," ").replace("\n"," ").strip())
              for k, v in row.items() if not k.startswith("_")} for row in rows]
+
+# ── Pre-review screening ──────────────────────────────────────────────────────
+# Findings, chair decisions and the extraction cache live in a local SQLite file
+# per conference (~/.pcc/prereview/<conference>.db), so they survive restarts.
+
+def _pr_store(conference: str):
+    return prereview_store.Store(conference or "default")
+
+@app.get("/api/prereview/catalogue")
+def prereview_catalogue():
+    return prereview_runner.catalogue()
+
+@app.get("/api/prereview/profile")
+async def prereview_get_profile(conference: str = ""):
+    st = await asyncio.to_thread(_pr_store, conference)
+    return {"profile": st.get_setting("profile", {}), "conf": st.get_setting("conf", {}), "db_path": str(st.path)}
+
+@app.post("/api/prereview/profile")
+async def prereview_set_profile(body: dict):
+    st = await asyncio.to_thread(_pr_store, str(body.get("conference") or ""))
+    if isinstance(body.get("profile"), dict):
+        st.put_setting("profile", body["profile"])
+    if isinstance(body.get("conf"), dict):
+        st.put_setting("conf", body["conf"])
+    return {"ok": True}
+
+@app.post("/api/prereview/run")
+async def prereview_run(
+    file: UploadFile = File(...),
+    conference: str = Form(""),
+    paper_json: str = Form("{}"),
+    conf_json: str = Form("{}"),
+    profile_json: str = Form("{}"),
+    force: bool = Form(False),
+):
+    content = await _read_upload(file)
+    try:
+        paper = json.loads(paper_json or "{}"); conf = json.loads(conf_json or "{}"); profile = json.loads(profile_json or "{}")
+    except Exception:
+        raise HTTPException(400, "paper_json, conf_json and profile_json must be JSON objects.")
+    def _go():
+        st = _pr_store(conference)
+        return prereview_runner.run_paper(st, content, file.filename or "paper.pdf", paper, conf, profile, force=force), st
+    res, st = await asyncio.to_thread(_go)
+    # Share the extracted text with AI screening (text mode) so it is not extracted again.
+    try:
+        doc = st.get_extraction(res["sha256"], prereview_docmodel.DOCMODEL_VERSION)
+        if doc and doc.get("full_text"):
+            _cache_text(content, doc["full_text"])
+    except Exception:
+        pass
+    return res
+
+@app.get("/api/prereview/results")
+async def prereview_results(conference: str = ""):
+    def _go():
+        st = _pr_store(conference)
+        return {"papers": prereview_runner.all_results(st), "db_path": str(st.path)}
+    return await asyncio.to_thread(_go)
+
+@app.post("/api/prereview/decision")
+async def prereview_decision(body: dict):
+    pid, key = str(body.get("paper_id") or ""), str(body.get("key") or "")
+    if not pid or not key:
+        raise HTTPException(400, "paper_id and key are required.")
+    def _go():
+        st = _pr_store(str(body.get("conference") or ""))
+        st.set_decision(pid, key, str(body.get("decision") or "open"), str(body.get("note") or "")[:2000])
+    try:
+        await asyncio.to_thread(_go)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+@app.get("/api/prereview/log")
+async def prereview_log(conference: str = "", paper_id: str = ""):
+    st = await asyncio.to_thread(_pr_store, conference)
+    return {"log": await asyncio.to_thread(st.decision_log, paper_id or None)}
+
+@app.post("/api/prereview/clear")
+async def prereview_clear(body: dict):
+    st = await asyncio.to_thread(_pr_store, str(body.get("conference") or ""))
+    await asyncio.to_thread(st.clear_results)
+    return {"ok": True}
 
 # ── Health & quit ─────────────────────────────────────────────────────────────
 
