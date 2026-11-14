@@ -27,7 +27,7 @@ jobs:
         include:
           - os: windows-latest
             asset: ProgramChairCopilot-windows-x64.exe
-          - os: macos-14            # Apple Silicon (M1/M2/M3/M4)
+          - os: macos-latest        # Apple Silicon (M1/M2/M3/M4); fixed versions like macos-14 get retired
             asset: ProgramChairCopilot-macos-arm64.zip
           - os: macos-15-intel      # Intel Macs
             asset: ProgramChairCopilot-macos-intel.zip
